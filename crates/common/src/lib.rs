@@ -1,0 +1,112 @@
+//! Shared, typed error primitives for the Rusternetes control plane.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Kubernetes API status reasons supported by the first vertical slice.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum StatusReason {
+    #[serde(rename = "Success")]
+    Success,
+    #[serde(rename = "AlreadyExists")]
+    AlreadyExists,
+    #[serde(rename = "BadRequest")]
+    BadRequest,
+    #[serde(rename = "Conflict")]
+    Conflict,
+    #[serde(rename = "InternalError")]
+    InternalError,
+    #[serde(rename = "Invalid")]
+    Invalid,
+    #[serde(rename = "MethodNotAllowed")]
+    MethodNotAllowed,
+    #[serde(rename = "NotFound")]
+    NotFound,
+}
+
+/// A typed reference to the resource named by an API operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceReference {
+    pub group: String,
+    pub resource: String,
+    pub namespace: Option<String>,
+    pub name: Option<String>,
+}
+
+impl ResourceReference {
+    pub fn config_map(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            group: String::new(),
+            resource: "configmaps".to_owned(),
+            namespace: Some(namespace.into()),
+            name: Some(name.into()),
+        }
+    }
+}
+
+impl fmt::Display for ResourceReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(formatter, "{} \"{}\"", self.resource, name),
+            None => write!(formatter, "{}", self.resource),
+        }
+    }
+}
+
+/// An error that has an intentional Kubernetes API representation.
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("{resource} already exists")]
+    AlreadyExists { resource: ResourceReference },
+    #[error("invalid request: {message}")]
+    BadRequest { message: String },
+    #[error("the object has been modified; please apply your changes to the latest version and try again")]
+    Conflict { resource: ResourceReference },
+    #[error("invalid ConfigMap: {message}")]
+    Invalid { message: String },
+    #[error("{resource} not found")]
+    NotFound { resource: ResourceReference },
+    #[error("unsupported HTTP method: {method}")]
+    MethodNotAllowed { method: String },
+    #[error("internal server error")]
+    Internal,
+}
+
+impl ApiError {
+    pub fn reason(&self) -> StatusReason {
+        match self {
+            Self::AlreadyExists { .. } => StatusReason::AlreadyExists,
+            Self::BadRequest { .. } => StatusReason::BadRequest,
+            Self::Conflict { .. } => StatusReason::Conflict,
+            Self::Invalid { .. } => StatusReason::Invalid,
+            Self::NotFound { .. } => StatusReason::NotFound,
+            Self::MethodNotAllowed { .. } => StatusReason::MethodNotAllowed,
+            Self::Internal => StatusReason::InternalError,
+        }
+    }
+
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::AlreadyExists { .. } | Self::Conflict { .. } => 409,
+            Self::BadRequest { .. } | Self::Invalid { .. } => 400,
+            Self::NotFound { .. } => 404,
+            Self::MethodNotAllowed { .. } => 405,
+            Self::Internal => 500,
+        }
+    }
+
+    pub fn details(&self) -> Option<&ResourceReference> {
+        match self {
+            Self::AlreadyExists { resource }
+            | Self::Conflict { resource }
+            | Self::NotFound { resource } => Some(resource),
+            Self::BadRequest { .. }
+            | Self::Invalid { .. }
+            | Self::MethodNotAllowed { .. }
+            | Self::Internal => None,
+        }
+    }
+}
