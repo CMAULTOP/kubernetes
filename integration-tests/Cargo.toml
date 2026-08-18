@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+futures-util.workspace = true
 idna_adapter.workspace = true
 reqwest.workspace = true
 rusternetes-api-server = { path = "../crates/api-server" }

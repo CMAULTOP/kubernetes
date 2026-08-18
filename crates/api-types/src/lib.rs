@@ -337,6 +337,81 @@ impl From<&ApiError> for ApiStatus {
     }
 }
 
+/// Kubernetes WATCH event kinds emitted by the ConfigMap resource endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub enum WatchEventType {
+    #[serde(rename = "ADDED")]
+    Added,
+    #[serde(rename = "MODIFIED")]
+    Modified,
+    #[serde(rename = "DELETED")]
+    Deleted,
+    #[serde(rename = "BOOKMARK")]
+    Bookmark,
+    #[serde(rename = "ERROR")]
+    Error,
+}
+
+/// The object carried by a typed ConfigMap watch event.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum ConfigMapWatchObject {
+    ConfigMap(ConfigMap),
+    Status(ApiStatus),
+}
+
+/// Kubernetes JSON WATCH event envelope for ConfigMap.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigMapWatchEvent {
+    #[serde(rename = "type")]
+    pub event_type: WatchEventType,
+    pub object: ConfigMapWatchObject,
+}
+
+impl ConfigMapWatchEvent {
+    pub fn added(resource: ConfigMap) -> Self {
+        Self {
+            event_type: WatchEventType::Added,
+            object: ConfigMapWatchObject::ConfigMap(resource),
+        }
+    }
+
+    pub fn modified(resource: ConfigMap) -> Self {
+        Self {
+            event_type: WatchEventType::Modified,
+            object: ConfigMapWatchObject::ConfigMap(resource),
+        }
+    }
+
+    pub fn deleted(resource: ConfigMap) -> Self {
+        Self {
+            event_type: WatchEventType::Deleted,
+            object: ConfigMapWatchObject::ConfigMap(resource),
+        }
+    }
+
+    pub fn bookmark(resource_version: String) -> Self {
+        Self {
+            event_type: WatchEventType::Bookmark,
+            object: ConfigMapWatchObject::ConfigMap(ConfigMap {
+                type_meta: TypeMeta::config_map(),
+                metadata: ObjectMeta {
+                    resource_version: Some(resource_version),
+                    ..ObjectMeta::default()
+                },
+                ..ConfigMap::default()
+            }),
+        }
+    }
+
+    pub fn error(status: ApiStatus) -> Self {
+        Self {
+            event_type: WatchEventType::Error,
+            object: ConfigMapWatchObject::Status(status),
+        }
+    }
+}
+
 /// Equality, set-membership, and existence label selector requirements.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LabelRequirement {

@@ -230,7 +230,7 @@ async fn client_observes_full_config_map_crud_and_concurrency_semantics() {
 }
 
 #[tokio::test]
-async fn client_can_list_all_namespaces_and_observes_watch_as_explicitly_unsupported() {
+async fn client_can_list_all_namespaces() {
     let server = start_server().await;
     let client = reqwest::Client::new();
 
@@ -258,19 +258,4 @@ async fn client_can_list_all_namespaces_and_observes_watch_as_explicitly_unsuppo
         .await
         .unwrap_or_else(|error| panic!("all namespaces list is ConfigMapList JSON: {error}"));
     assert_eq!(list.items.len(), 2);
-
-    let watch_response = client
-        .get(format!(
-            "{}/api/v1/namespaces/default/configmaps",
-            server.base_url
-        ))
-        .query(&[("watch", "true")])
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("unsupported watch request completes: {error}"));
-    assert_eq!(watch_response.status(), reqwest::StatusCode::NOT_FOUND);
-    assert_eq!(
-        response_status(watch_response).await.reason,
-        StatusReason::NotFound
-    );
 }

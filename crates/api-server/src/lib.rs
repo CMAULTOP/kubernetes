@@ -1,9 +1,10 @@
 //! Axum HTTP API server for the first Rusternetes vertical slice.
 
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
+use async_stream::stream;
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -11,11 +12,11 @@ use axum::{
     Json, Router,
 };
 use rusternetes_api_types::{
-    core_api_versions, core_v1_resources, ApiStatus, ConfigMap, ConfigMapList, DeleteOptions,
-    FieldSelector, LabelSelector,
+    core_api_versions, core_v1_resources, ApiStatus, ConfigMap, DeleteOptions, FieldSelector,
+    LabelSelector,
 };
 use rusternetes_common::{ApiError, ResourceReference};
-use rusternetes_storage::InMemoryConfigMapStore;
+use rusternetes_storage::{ConfigMapWatchRequest, InMemoryConfigMapStore};
 use serde::{Deserialize, Serialize};
 
 /// Shared immutable application state. The storage crate remains the sole owner of mutable data.
@@ -80,7 +81,11 @@ struct ListQuery {
     #[serde(default)]
     field_selector: Option<String>,
     #[serde(default)]
+    resource_version: Option<String>,
+    #[serde(default)]
     watch: Option<String>,
+    #[serde(default)]
+    allow_watch_bookmarks: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -122,8 +127,11 @@ async fn core_v1_api_resources() -> Json<rusternetes_api_types::ApiResourceList>
 async fn list_all_config_maps(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<Json<ConfigMapList>> {
-    ensure_not_watch(&query, None)?;
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_config_map_watch(&state, &query, None).await;
+    }
+    reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
@@ -131,15 +139,19 @@ async fn list_all_config_maps(
             .store
             .list(None, &label_selector, &field_selector)
             .await,
-    ))
+    )
+    .into_response())
 }
 
 async fn list_config_maps(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
-) -> ApiResult<Json<ConfigMapList>> {
-    ensure_not_watch(&query, Some(namespace.as_str()))?;
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_config_map_watch(&state, &query, Some(namespace)).await;
+    }
+    reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
@@ -147,7 +159,8 @@ async fn list_config_maps(
             .store
             .list(Some(&namespace), &label_selector, &field_selector)
             .await,
-    ))
+    )
+    .into_response())
 }
 
 async fn create_config_map(
@@ -201,17 +214,91 @@ async fn not_found() -> ApiRejection {
     .into()
 }
 
-fn ensure_not_watch(query: &ListQuery, namespace: Option<&str>) -> ApiResult<()> {
-    if query.watch.is_some() {
-        let resource = ResourceReference {
-            group: String::new(),
-            resource: "configmaps".to_owned(),
-            namespace: namespace.map(str::to_owned),
-            name: None,
-        };
-        return Err(ApiError::NotFound { resource }.into());
+async fn open_config_map_watch(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: Option<String>,
+) -> ApiResult<Response> {
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    let subscription = state
+        .store
+        .watch(ConfigMapWatchRequest {
+            namespace,
+            label_selector,
+            field_selector,
+            resource_version: query.resource_version.clone(),
+            allow_bookmarks: parse_boolean(
+                query.allow_watch_bookmarks.as_deref(),
+                "allowWatchBookmarks",
+            )?,
+        })
+        .await?;
+    Ok(watch_response(subscription))
+}
+
+fn is_watch_request(query: &ListQuery) -> ApiResult<bool> {
+    match query.watch.as_deref() {
+        None | Some("false") | Some("0") => Ok(false),
+        Some("true") | Some("1") => Ok(true),
+        Some(value) => Err(ApiError::BadRequest {
+            message: format!("watch {value:?} must be a boolean"),
+        }
+        .into()),
+    }
+}
+
+fn parse_boolean(raw: Option<&str>, field: &str) -> ApiResult<bool> {
+    match raw {
+        None | Some("false") | Some("0") => Ok(false),
+        Some("true") | Some("1") => Ok(true),
+        Some(value) => Err(ApiError::BadRequest {
+            message: format!("{field} {value:?} must be a boolean"),
+        }
+        .into()),
+    }
+}
+
+fn reject_list_resource_version(query: &ListQuery) -> ApiResult<()> {
+    if query
+        .resource_version
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(ApiError::BadRequest {
+            message: "resourceVersion on LIST is not implemented by the in-memory backend; use it only with watch=true"
+                .to_owned(),
+        }
+        .into());
     }
     Ok(())
+}
+
+fn watch_response(subscription: rusternetes_storage::ConfigMapWatchSubscription) -> Response {
+    let event_stream = stream! {
+        let mut subscription = subscription;
+        while let Some(event) = subscription.recv().await {
+            let mut encoded = match serde_json::to_vec(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    yield Err::<Bytes, io::Error>(io::Error::new(io::ErrorKind::Other, error));
+                    break;
+                }
+            };
+            encoded.push(b'\n');
+            yield Ok::<Bytes, io::Error>(Bytes::from(encoded));
+        }
+    };
+    let mut response = Response::new(Body::from_stream(event_stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 fn decode_config_map(body: Bytes) -> ApiResult<ConfigMap> {

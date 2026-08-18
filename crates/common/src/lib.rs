@@ -16,6 +16,8 @@ pub enum StatusReason {
     BadRequest,
     #[serde(rename = "Conflict")]
     Conflict,
+    #[serde(rename = "Expired")]
+    Expired,
     #[serde(rename = "InternalError")]
     InternalError,
     #[serde(rename = "Invalid")]
@@ -67,6 +69,8 @@ pub enum ApiError {
     Conflict { resource: ResourceReference },
     #[error("invalid ConfigMap: {message}")]
     Invalid { message: String },
+    #[error("resource version has expired: {message}")]
+    ResourceExpired { message: String },
     #[error("{resource} not found")]
     NotFound { resource: ResourceReference },
     #[error("unsupported HTTP method: {method}")]
@@ -82,6 +86,7 @@ impl ApiError {
             Self::BadRequest { .. } => StatusReason::BadRequest,
             Self::Conflict { .. } => StatusReason::Conflict,
             Self::Invalid { .. } => StatusReason::Invalid,
+            Self::ResourceExpired { .. } => StatusReason::Expired,
             Self::NotFound { .. } => StatusReason::NotFound,
             Self::MethodNotAllowed { .. } => StatusReason::MethodNotAllowed,
             Self::Internal => StatusReason::InternalError,
@@ -92,6 +97,7 @@ impl ApiError {
         match self {
             Self::AlreadyExists { .. } | Self::Conflict { .. } => 409,
             Self::BadRequest { .. } | Self::Invalid { .. } => 400,
+            Self::ResourceExpired { .. } => 410,
             Self::NotFound { .. } => 404,
             Self::MethodNotAllowed { .. } => 405,
             Self::Internal => 500,
@@ -105,6 +111,7 @@ impl ApiError {
             | Self::NotFound { resource } => Some(resource),
             Self::BadRequest { .. }
             | Self::Invalid { .. }
+            | Self::ResourceExpired { .. }
             | Self::MethodNotAllowed { .. }
             | Self::Internal => None,
         }

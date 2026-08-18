@@ -1,17 +1,23 @@
-//! Atomic storage operations for namespaced ConfigMaps.
+//! Atomic storage and bounded WATCH operations for namespaced ConfigMaps.
 //!
 //! The store owns all mutable ConfigMap state. HTTP layers never access its map directly;
-//! every mutation has one linearization point inside the write lock.
+//! every mutation has one linearization point inside the write lock. Watch history and watcher
+//! registration live in the same state owner so a list-then-watch client cannot miss a mutation
+//! between replay and registration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use rusternetes_api_types::{
-    ConfigMap, ConfigMapList, DeleteOptions, FieldSelector, LabelSelector,
+    ConfigMap, ConfigMapList, ConfigMapWatchEvent, DeleteOptions, FieldSelector, LabelSelector,
 };
 use rusternetes_common::{ApiError, ResourceReference};
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
+
+/// Maximum retained ConfigMap events in the single-process history window.
+pub const WATCH_HISTORY_CAPACITY: usize = 256;
+const WATCHER_CHANNEL_CAPACITY: usize = WATCH_HISTORY_CAPACITY + 1;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ResourceKey {
@@ -32,10 +38,36 @@ impl ResourceKey {
     }
 }
 
+#[derive(Clone)]
+struct HistoryEvent {
+    revision: u64,
+    resource: ConfigMap,
+    event: ConfigMapWatchEvent,
+}
+
+struct WatchRegistration {
+    namespace: Option<String>,
+    label_selector: LabelSelector,
+    field_selector: FieldSelector,
+    sender: mpsc::Sender<ConfigMapWatchEvent>,
+}
+
+impl WatchRegistration {
+    fn matches(&self, resource: &ConfigMap) -> bool {
+        self.namespace.as_deref().map_or(true, |namespace| {
+            resource.metadata.namespace.as_deref() == Some(namespace)
+        }) && self.label_selector.matches(&resource.metadata.labels)
+            && self.field_selector.matches(resource)
+    }
+}
+
 #[derive(Default)]
 struct StoreState {
     revision: u64,
+    next_watcher_id: u64,
     config_maps: BTreeMap<ResourceKey, ConfigMap>,
+    history: VecDeque<HistoryEvent>,
+    watchers: BTreeMap<u64, WatchRegistration>,
 }
 
 impl StoreState {
@@ -47,6 +79,42 @@ impl StoreState {
     fn current_resource_version(&self) -> String {
         self.revision.to_string()
     }
+
+    fn allocate_watcher_id(&mut self) -> Result<u64, ApiError> {
+        let watcher_id = self.next_watcher_id;
+        self.next_watcher_id = self
+            .next_watcher_id
+            .checked_add(1)
+            .ok_or(ApiError::Internal)?;
+        Ok(watcher_id)
+    }
+
+    fn publish(&mut self, history_event: HistoryEvent) {
+        let event = history_event.event.clone();
+        let resource = history_event.resource.clone();
+        self.history.push_back(history_event);
+        if self.history.len() > WATCH_HISTORY_CAPACITY {
+            self.history.pop_front();
+        }
+
+        let slow_or_closed_watchers = self
+            .watchers
+            .iter()
+            .filter_map(|(watcher_id, watcher)| {
+                if !watcher.matches(&resource) {
+                    return None;
+                }
+                match watcher.sender.try_send(event.clone()) {
+                    Ok(()) => None,
+                    Err(mpsc::error::TrySendError::Full(_))
+                    | Err(mpsc::error::TrySendError::Closed(_)) => Some(*watcher_id),
+                }
+            })
+            .collect::<Vec<_>>();
+        for watcher_id in slow_or_closed_watchers {
+            self.watchers.remove(&watcher_id);
+        }
+    }
 }
 
 /// Result of a successful delete operation.
@@ -55,14 +123,56 @@ pub struct DeleteResult {
     pub resource_version: String,
 }
 
-/// In-memory single-process ConfigMap storage.
+/// Selector and resume options for a ConfigMap watch subscription.
+#[derive(Clone, Debug, Default)]
+pub struct ConfigMapWatchRequest {
+    pub namespace: Option<String>,
+    pub label_selector: LabelSelector,
+    pub field_selector: FieldSelector,
+    /// The opaque HTTP resourceVersion requested by the client. `None` starts from now.
+    pub resource_version: Option<String>,
+    pub allow_bookmarks: bool,
+}
+
+/// A live ConfigMap watch subscription. Dropping it schedules registry cleanup without blocking.
+pub struct ConfigMapWatchSubscription {
+    receiver: mpsc::Receiver<ConfigMapWatchEvent>,
+    watcher_id: u64,
+    cleanup_sender: mpsc::UnboundedSender<u64>,
+}
+
+impl ConfigMapWatchSubscription {
+    pub async fn recv(&mut self) -> Option<ConfigMapWatchEvent> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for ConfigMapWatchSubscription {
+    fn drop(&mut self) {
+        let _ = self.cleanup_sender.send(self.watcher_id);
+    }
+}
+
+/// In-memory single-process ConfigMap storage with bounded watch history.
 ///
-/// This is intentionally a concrete storage implementation for the first slice. A future
-/// durable backend will implement the storage boundary only after its consistency and watch
-/// semantics have been defined.
-#[derive(Default)]
+/// One `RwLock` protects the storage's only shared state: objects, revision, bounded history and
+/// watcher registrations. Watch event delivery uses `try_send` and never awaits while holding the
+/// lock. A separate short-lived mutex only drains cancellation IDs emitted by dropped HTTP streams.
 pub struct InMemoryConfigMapStore {
     state: RwLock<StoreState>,
+    closed_watchers_sender: mpsc::UnboundedSender<u64>,
+    closed_watchers_receiver: Mutex<mpsc::UnboundedReceiver<u64>>,
+}
+
+impl Default for InMemoryConfigMapStore {
+    fn default() -> Self {
+        let (closed_watchers_sender, closed_watchers_receiver) = mpsc::unbounded_channel();
+        Self {
+            state: RwLock::new(StoreState::default()),
+            closed_watchers_sender,
+            closed_watchers_receiver: Mutex::new(closed_watchers_receiver),
+        }
+    }
 }
 
 impl InMemoryConfigMapStore {
@@ -70,7 +180,25 @@ impl InMemoryConfigMapStore {
         Self::default()
     }
 
+    async fn drain_closed_watchers(&self) {
+        let mut receiver = self.closed_watchers_receiver.lock().await;
+        let mut watcher_ids = Vec::new();
+        while let Ok(watcher_id) = receiver.try_recv() {
+            watcher_ids.push(watcher_id);
+        }
+        drop(receiver);
+
+        if watcher_ids.is_empty() {
+            return;
+        }
+        let mut state = self.state.write().await;
+        for watcher_id in watcher_ids {
+            state.watchers.remove(&watcher_id);
+        }
+    }
+
     pub async fn create(&self, mut resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+        self.drain_closed_watchers().await;
         resource.enforce_type_meta()?;
         resource.validate()?;
         let key = ResourceKey::new(
@@ -90,7 +218,14 @@ impl InMemoryConfigMapStore {
             OffsetDateTime::now_utc(),
             resource_version,
         );
+        let event = ConfigMapWatchEvent::added(resource.clone());
+        let history_event = HistoryEvent {
+            revision: state.revision,
+            resource: resource.clone(),
+            event,
+        };
         state.config_maps.insert(key, resource.clone());
+        state.publish(history_event);
         Ok(resource)
     }
 
@@ -106,9 +241,10 @@ impl InMemoryConfigMapStore {
             })
     }
 
-    /// Updates a ConfigMap atomically. An explicit resource version is compared with the
-    /// current version; an omitted version is deliberately allowed by ConfigMap semantics.
+    /// Updates a ConfigMap atomically. An explicit resource version is compared with the current
+    /// version; an omitted version is deliberately allowed by ConfigMap semantics.
     pub async fn update(&self, mut resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+        self.drain_closed_watchers().await;
         resource.enforce_type_meta()?;
         let key = ResourceKey::new(
             resource.namespace()?.to_owned(),
@@ -140,7 +276,14 @@ impl InMemoryConfigMapStore {
         resource.validate_update(&previous)?;
         let resource_version = state.next_resource_version();
         resource.preserve_server_metadata_from(&previous, resource_version);
+        let event = ConfigMapWatchEvent::modified(resource.clone());
+        let history_event = HistoryEvent {
+            revision: state.revision,
+            resource: resource.clone(),
+            event,
+        };
         state.config_maps.insert(key, resource.clone());
+        state.publish(history_event);
         Ok(resource)
     }
 
@@ -150,15 +293,17 @@ impl InMemoryConfigMapStore {
         name: &str,
         options: DeleteOptions,
     ) -> Result<DeleteResult, ApiError> {
+        self.drain_closed_watchers().await;
         let key = ResourceKey::new(namespace, name);
         let mut state = self.state.write().await;
-        let current = state
-            .config_maps
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound {
-                resource: key.reference(),
-            })?;
+        let mut current =
+            state
+                .config_maps
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| ApiError::NotFound {
+                    resource: key.reference(),
+                })?;
 
         if !current.metadata.finalizers.is_empty() {
             return Err(ApiError::BadRequest {
@@ -184,6 +329,14 @@ impl InMemoryConfigMapStore {
 
         state.config_maps.remove(&key);
         let resource_version = state.next_resource_version();
+        current.metadata.resource_version = Some(resource_version.clone());
+        let event = ConfigMapWatchEvent::deleted(current.clone());
+        let history_event = HistoryEvent {
+            revision: state.revision,
+            resource: current,
+            event,
+        };
+        state.publish(history_event);
         Ok(DeleteResult { resource_version })
     }
 
@@ -207,13 +360,89 @@ impl InMemoryConfigMapStore {
             .collect();
         ConfigMapList::new(state.current_resource_version(), items)
     }
+
+    /// Registers a bounded subscription after atomically queuing all matching events newer than the
+    /// requested resource version. A `410 Expired` error means the caller must perform a fresh LIST.
+    pub async fn watch(
+        &self,
+        request: ConfigMapWatchRequest,
+    ) -> Result<ConfigMapWatchSubscription, ApiError> {
+        self.drain_closed_watchers().await;
+        let requested_revision = parse_resource_version(request.resource_version.as_deref())?;
+        let mut state = self.state.write().await;
+
+        if let Some(oldest) = state.history.front() {
+            if requested_revision < oldest.revision.saturating_sub(1) {
+                return Err(ApiError::ResourceExpired {
+                    message: format!(
+                        "too old resource version: {requested_revision}; oldest available replay point is {}",
+                        oldest.revision.saturating_sub(1)
+                    ),
+                });
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
+        for history_event in state
+            .history
+            .iter()
+            .filter(|history_event| history_event.revision > requested_revision)
+            .filter(|history_event| {
+                request.namespace.as_deref().map_or(true, |namespace| {
+                    history_event.resource.metadata.namespace.as_deref() == Some(namespace)
+                }) && request
+                    .label_selector
+                    .matches(&history_event.resource.metadata.labels)
+                    && request.field_selector.matches(&history_event.resource)
+            })
+        {
+            sender
+                .try_send(history_event.event.clone())
+                .map_err(|_| ApiError::Internal)?;
+        }
+        if request.allow_bookmarks {
+            sender
+                .try_send(ConfigMapWatchEvent::bookmark(
+                    state.current_resource_version(),
+                ))
+                .map_err(|_| ApiError::Internal)?;
+        }
+
+        let watcher_id = state.allocate_watcher_id()?;
+        state.watchers.insert(
+            watcher_id,
+            WatchRegistration {
+                namespace: request.namespace,
+                label_selector: request.label_selector,
+                field_selector: request.field_selector,
+                sender,
+            },
+        );
+
+        Ok(ConfigMapWatchSubscription {
+            receiver,
+            watcher_id,
+            cleanup_sender: self.closed_watchers_sender.clone(),
+        })
+    }
+}
+
+fn parse_resource_version(raw: Option<&str>) -> Result<u64, ApiError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+    raw.parse::<u64>().map_err(|_| ApiError::BadRequest {
+        message: format!(
+            "resourceVersion {raw:?} is not a valid opaque version for this storage backend"
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use rusternetes_api_types::{ObjectMeta, TypeMeta};
+    use rusternetes_api_types::{FieldSelector, ObjectMeta, TypeMeta, WatchEventType};
 
     use super::*;
 
@@ -311,5 +540,84 @@ mod tests {
         let list = store.list(Some("default"), &selector, &fields).await;
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].metadata.name.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn watch_replays_then_delivers_live_events_in_revision_order() {
+        let store = InMemoryConfigMapStore::new();
+        let created = store
+            .create(config_map("settings"))
+            .await
+            .expect("create succeeds");
+        let mut watch = store
+            .watch(ConfigMapWatchRequest {
+                namespace: Some("default".to_owned()),
+                resource_version: Some("0".to_owned()),
+                ..ConfigMapWatchRequest::default()
+            })
+            .await
+            .expect("watch starts from history");
+
+        let replayed = watch.recv().await.expect("replayed event is available");
+        assert_eq!(replayed.event_type, WatchEventType::Added);
+
+        let mut update = created;
+        update.data.insert("mode".to_owned(), "updated".to_owned());
+        let updated = store.update(update).await.expect("update succeeds");
+        let modified = watch.recv().await.expect("live modification is available");
+        assert_eq!(modified.event_type, WatchEventType::Modified);
+
+        store
+            .delete("default", "settings", DeleteOptions::default())
+            .await
+            .expect("delete succeeds");
+        let deleted = watch.recv().await.expect("live deletion is available");
+        assert_eq!(deleted.event_type, WatchEventType::Deleted);
+        assert_eq!(updated.metadata.resource_version.as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn old_resource_version_is_expired_after_history_compaction() {
+        let store = InMemoryConfigMapStore::new();
+        for index in 0..=WATCH_HISTORY_CAPACITY {
+            store
+                .create(config_map(&format!("settings-{index}")))
+                .await
+                .expect("create succeeds");
+        }
+
+        assert!(matches!(
+            store
+                .watch(ConfigMapWatchRequest {
+                    resource_version: Some("0".to_owned()),
+                    ..ConfigMapWatchRequest::default()
+                })
+                .await,
+            Err(ApiError::ResourceExpired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_watcher_is_removed_without_unbounded_queue_growth() {
+        let store = InMemoryConfigMapStore::new();
+        let slow_watcher = store
+            .watch(ConfigMapWatchRequest::default())
+            .await
+            .expect("watch starts at current version");
+
+        for index in 0..=WATCHER_CHANNEL_CAPACITY {
+            store
+                .create(config_map(&format!("queued-{index}")))
+                .await
+                .expect("create succeeds");
+        }
+        drop(slow_watcher);
+        store
+            .create(config_map("cleanup-trigger"))
+            .await
+            .expect("create after closed watcher succeeds");
+
+        let state = store.state.read().await;
+        assert!(state.watchers.is_empty());
     }
 }

@@ -16,11 +16,13 @@ license = "Apache-2.0"
 repository = "https://github.com/CMAULTOP/kubernetes"
 
 [workspace.dependencies]
+async-stream = "=0.3.6"
 axum = "=0.7.9"
 base64 = "=0.22.1"
+futures-util = "=0.3.34"
 http = "=1.2.0"
 idna_adapter = "=1.1.0"
-reqwest = { version = "=0.12.12", default-features = false, features = ["json"] }
+reqwest = { version = "=0.12.12", default-features = false, features = ["json", "stream"] }
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_json = "=1.0.134"
 thiserror = "=1.0.69"
