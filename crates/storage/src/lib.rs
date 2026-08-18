@@ -54,9 +54,10 @@ struct WatchRegistration {
 
 impl WatchRegistration {
     fn matches(&self, resource: &ConfigMap) -> bool {
-        self.namespace.as_deref().map_or(true, |namespace| {
-            resource.metadata.namespace.as_deref() == Some(namespace)
-        }) && self.label_selector.matches(&resource.metadata.labels)
+        self.namespace
+            .as_deref()
+            .is_none_or(|namespace| resource.metadata.namespace.as_deref() == Some(namespace))
+            && self.label_selector.matches(&resource.metadata.labels)
             && self.field_selector.matches(resource)
     }
 }
@@ -352,7 +353,7 @@ impl InMemoryConfigMapStore {
             .config_maps
             .iter()
             .filter(|(key, resource)| {
-                namespace.map_or(true, |requested| key.namespace == requested)
+                namespace.is_none_or(|requested| key.namespace == requested)
                     && label_selector.matches(&resource.metadata.labels)
                     && field_selector.matches(resource)
             })
@@ -388,7 +389,7 @@ impl InMemoryConfigMapStore {
             .iter()
             .filter(|history_event| history_event.revision > requested_revision)
             .filter(|history_event| {
-                request.namespace.as_deref().map_or(true, |namespace| {
+                request.namespace.as_deref().is_none_or(|namespace| {
                     history_event.resource.metadata.namespace.as_deref() == Some(namespace)
                 }) && request
                     .label_selector

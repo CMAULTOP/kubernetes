@@ -1,0 +1,20 @@
+[package]
+name = "rusternetes-storage-etcd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+etcd-client.workspace = true
+rusternetes-api-types = { path = "../api-types" }
+rusternetes-common = { path = "../common" }
+rusternetes-storage = { path = "../storage" }
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

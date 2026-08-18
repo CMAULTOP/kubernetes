@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/api-types",
     "crates/storage",
+    "crates/storage-etcd",
     "crates/api-server",
     "integration-tests",
 ]
@@ -11,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/CMAULTOP/kubernetes"
 
@@ -19,6 +20,7 @@ repository = "https://github.com/CMAULTOP/kubernetes"
 async-stream = "=0.3.6"
 axum = "=0.7.9"
 base64 = "=0.22.1"
+etcd-client = "=0.16.0"
 futures-util = "=0.3.34"
 http = "=1.2.0"
 idna_adapter = "=1.1.0"

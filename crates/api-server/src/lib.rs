@@ -281,7 +281,7 @@ fn watch_response(subscription: rusternetes_storage::ConfigMapWatchSubscription)
             let mut encoded = match serde_json::to_vec(&event) {
                 Ok(encoded) => encoded,
                 Err(error) => {
-                    yield Err::<Bytes, io::Error>(io::Error::new(io::ErrorKind::Other, error));
+                    yield Err::<Bytes, io::Error>(io::Error::other(error));
                     break;
                 }
             };
