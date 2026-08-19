@@ -1158,3 +1158,76 @@ async fn config_map_pagination_preserves_an_etcd_snapshot_across_continuation_re
     assert_eq!(final_page.metadata.resource_version, resource_version);
     assert!(final_page.metadata.continue_token.is_none());
 }
+
+#[tokio::test]
+async fn service_account_patch_persists_through_configured_etcd_backend() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-serviceaccount-patch/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let repository = EtcdServiceAccountRepository::connect(
+        [endpoint.as_str()],
+        Some(&format!("{prefix}/serviceaccounts")),
+    )
+    .await
+    .expect("direct ServiceAccount repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let collection = format!(
+        "{}/api/v1/namespaces/default/serviceaccounts",
+        server.base_url
+    );
+    let created_response = client
+        .post(&collection)
+        .json(&ServiceAccount {
+            type_meta: TypeMeta::service_account(),
+            metadata: ObjectMeta {
+                name: Some("patch-robot".to_owned()),
+                ..ObjectMeta::default()
+            },
+            ..ServiceAccount::default()
+        })
+        .send()
+        .await
+        .expect("ServiceAccount create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: ServiceAccount = created_response.json().await.expect("typed response");
+    let endpoint = format!("{collection}/patch-robot");
+
+    let merged_response = client
+        .patch(&endpoint)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/merge-patch+json",
+        )
+        .body(r#"{"automountServiceAccountToken":false}"#)
+        .send()
+        .await
+        .expect("merge patch completes");
+    assert_eq!(merged_response.status(), reqwest::StatusCode::OK);
+    let merged: ServiceAccount = merged_response.json().await.expect("typed response");
+    assert_eq!(merged.automount_service_account_token, Some(false));
+    assert_eq!(merged.metadata.uid, created.metadata.uid);
+
+    let json_response = client
+        .patch(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json-patch+json")
+        .body(r#"[{"op":"replace","path":"/automountServiceAccountToken","value":true}]"#)
+        .send()
+        .await
+        .expect("JSON patch completes");
+    assert_eq!(json_response.status(), reqwest::StatusCode::OK);
+    let updated: ServiceAccount = json_response.json().await.expect("typed response");
+    assert_eq!(updated.automount_service_account_token, Some(true));
+    assert_ne!(
+        updated.metadata.resource_version,
+        merged.metadata.resource_version
+    );
+
+    let persisted = repository
+        .get("default", "patch-robot")
+        .await
+        .expect("direct etcd read succeeds");
+    assert_eq!(persisted, updated);
+}

@@ -794,6 +794,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             "/api/v1/namespaces/:namespace/serviceaccounts/:name",
             get(get_service_account)
                 .put(replace_service_account)
+                .patch(patch_service_account)
                 .delete(delete_service_account),
         )
         .route(
@@ -1647,6 +1648,25 @@ async fn replace_service_account(
     let resource =
         bind_service_account_update_identity(decode_service_account(body)?, &namespace, &name)?;
     Ok(Json(state.backend.service_accounts.update(resource).await?))
+}
+
+async fn patch_service_account(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<ServiceAccount>> {
+    let current = state
+        .backend
+        .service_accounts
+        .get(&namespace, &name)
+        .await?;
+    let patched = bind_service_account_update_identity(
+        apply_service_account_patch(current, &headers, body)?,
+        &namespace,
+        &name,
+    )?;
+    Ok(Json(state.backend.service_accounts.update(patched).await?))
 }
 
 async fn create_service_account_token(
@@ -2555,6 +2575,50 @@ fn apply_pod_patch(current: Pod, headers: &HeaderMap, body: Bytes) -> ApiResult<
     serde_json::from_value(document).map_err(|error| {
         ApiError::Invalid {
             message: format!("PATCH result is not a valid Pod: {error}"),
+        }
+        .into()
+    })
+}
+
+fn apply_service_account_patch(
+    current: ServiceAccount,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> ApiResult<ServiceAccount> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a ServiceAccount PATCH request body is required".to_owned(),
+        }
+        .into());
+    }
+    let mut document = serde_json::to_value(current).map_err(|_| ApiError::Internal)?;
+    match node_patch_format(headers)? {
+        NodePatchFormat::JsonPatch => {
+            let patch: json_patch::Patch =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Patch document: {error}"),
+                })?;
+            json_patch::patch(&mut document, &patch).map_err(|error| ApiError::Invalid {
+                message: format!("JSON Patch could not be applied: {error}"),
+            })?;
+        }
+        NodePatchFormat::MergePatch => {
+            let patch: Value =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Merge Patch document: {error}"),
+                })?;
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest {
+                    message: "JSON Merge Patch document must be an object".to_owned(),
+                }
+                .into());
+            }
+            json_patch::merge(&mut document, &patch);
+        }
+    }
+    serde_json::from_value(document).map_err(|error| {
+        ApiError::Invalid {
+            message: format!("PATCH result is not a valid ServiceAccount: {error}"),
         }
         .into()
     })
@@ -4259,5 +4323,174 @@ mod pagination_route_tests {
             .await
             .expect("router is infallible");
         assert_eq!(incompatible_watch.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod service_account_patch_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Request, StatusCode},
+    };
+    use rusternetes_api_types::{ApiStatus, ObjectMeta, ServiceAccount, TypeMeta};
+    use rusternetes_common::StatusReason;
+    use rusternetes_storage::InMemoryConfigMapStore;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn service_account(name: &str) -> ServiceAccount {
+        ServiceAccount {
+            type_meta: TypeMeta::service_account(),
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                namespace: Some("default".to_owned()),
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                ..ObjectMeta::default()
+            },
+            automount_service_account_token: Some(true),
+            ..ServiceAccount::default()
+        }
+    }
+
+    async fn decode_service_account(response: axum::response::Response) -> ServiceAccount {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("ServiceAccount response body is readable"),
+        )
+        .expect("ServiceAccount response is JSON")
+    }
+
+    async fn decode_status(response: axum::response::Response) -> ApiStatus {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("status response body is readable"),
+        )
+        .expect("status response is Kubernetes Status JSON")
+    }
+
+    #[tokio::test]
+    async fn service_account_patch_supports_merge_and_json_patch_with_identity_and_cas_guards() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let collection = "/api/v1/namespaces/default/serviceaccounts";
+        let resource = service_account("build-robot");
+        let created_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(collection)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&resource).expect("fixture ServiceAccount serializes"),
+                    ))
+                    .expect("valid create request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(created_response.status(), StatusCode::CREATED);
+        let created = decode_service_account(created_response).await;
+        let endpoint = format!("{collection}/build-robot");
+
+        let merged_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&endpoint)
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"metadata":{"labels":{"team":"platform"}}}"#))
+                    .expect("valid merge patch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(merged_response.status(), StatusCode::OK);
+        let merged = decode_service_account(merged_response).await;
+        assert_eq!(merged.metadata.labels.get("app"), Some(&"api".to_owned()));
+        assert_eq!(
+            merged.metadata.labels.get("team"),
+            Some(&"platform".to_owned())
+        );
+        assert_eq!(merged.metadata.uid, created.metadata.uid);
+        assert_ne!(
+            merged.metadata.resource_version,
+            created.metadata.resource_version
+        );
+
+        let json_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&endpoint)
+                    .header(header::CONTENT_TYPE, "application/json-patch+json")
+                    .body(Body::from(
+                        r#"[{"op":"replace","path":"/automountServiceAccountToken","value":false}]"#,
+                    ))
+                    .expect("valid JSON patch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(json_response.status(), StatusCode::OK);
+        let patched = decode_service_account(json_response).await;
+        assert_eq!(patched.automount_service_account_token, Some(false));
+        assert_eq!(patched.metadata.labels, merged.metadata.labels);
+
+        let stale_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&endpoint)
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "metadata": {"resourceVersion": created.metadata.resource_version}
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid stale patch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&endpoint)
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"metadata":{"namespace":"other"}}"#))
+                    .expect("valid identity mutation request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(identity_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            decode_status(identity_response).await.reason,
+            StatusReason::Invalid
+        );
+
+        let media_type_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&endpoint)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("valid unsupported patch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(
+            media_type_response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 }
