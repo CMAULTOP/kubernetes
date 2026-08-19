@@ -13,7 +13,8 @@ use rusternetes_admission::{
 };
 use rusternetes_api_server::{
     core_backend_from_etcd_config, router_with_backend_auth_authorization_and_admission,
-    router_with_core_backend_and_auth, AuthorizationMode, ConfigMapBackend, CoreApiBackend,
+    router_with_core_backend_and_auth, router_with_core_backend_auth_and_authorization,
+    AuthorizationMode, ConfigMapBackend, CoreApiBackend,
 };
 use rusternetes_api_types::{
     ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, Node, ObjectMeta, Pod, PodPhase,
@@ -138,6 +139,30 @@ async fn start_core_server_with_auth(
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, application).await {
             panic!("etcd-backed core API Server fails: {error}");
+        }
+    });
+    TestServer {
+        base_url: format!("http://{address}"),
+        task,
+    }
+}
+
+async fn start_core_server_with_auth_and_authorization(
+    backend: CoreApiBackend,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
+) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|error| panic!("authorized core HTTP listener binds: {error}"));
+    let address = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("authorized core HTTP listener reports address: {error}"));
+    let application =
+        router_with_core_backend_auth_and_authorization(backend, authentication, authorization);
+    let task = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, application).await {
+            panic!("authorized etcd-backed core API Server fails: {error}");
         }
     });
     TestServer {
@@ -1333,6 +1358,114 @@ async fn token_review_validates_a_durable_serviceaccount_jwt_through_real_etcd()
         created.metadata.uid.as_deref()
     );
     assert_eq!(review["status"]["audiences"], serde_json::json!(["api"]));
+}
+
+#[tokio::test]
+async fn self_subject_access_review_evaluates_rbac_through_real_etcd_core_server() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-ssar-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let reviewer = RequestIdentity::authenticated(
+        "etcd-access-reviewer",
+        Some("etcd-reviewer-uid".to_owned()),
+        ["reviewers".to_owned()],
+        Default::default(),
+    )
+    .expect("reviewer identity is valid");
+    let authentication = AuthenticationChain::new(
+        AnonymousPolicy::Deny,
+        vec![StaticBearerToken::new("etcd-reviewer-secret", reviewer)
+            .expect("reviewer token is valid")],
+    );
+    let policy = RbacAuthorizer::new(
+        Vec::new(),
+        vec![ClusterRole {
+            name: "etcd-self-reviewer".to_owned(),
+            rules: vec![
+                PolicyRule {
+                    api_groups: vec!["authorization.k8s.io".to_owned()],
+                    resources: vec!["selfsubjectaccessreviews".to_owned()],
+                    verbs: vec!["create".to_owned()],
+                    ..PolicyRule::default()
+                },
+                PolicyRule {
+                    api_groups: vec![String::new()],
+                    resources: vec!["configmaps".to_owned()],
+                    verbs: vec!["get".to_owned()],
+                    ..PolicyRule::default()
+                },
+            ],
+        }],
+        Vec::new(),
+        vec![ClusterRoleBinding {
+            name: "etcd-self-reviewer-binding".to_owned(),
+            subjects: vec![Subject::User("etcd-access-reviewer".to_owned())],
+            role_ref: "etcd-self-reviewer".to_owned(),
+        }],
+    );
+    let server = start_core_server_with_auth_and_authorization(
+        backend,
+        authentication,
+        AuthorizationMode::Rbac(policy),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let endpoint = format!(
+        "{}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+        server.base_url
+    );
+
+    let allowed_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-reviewer-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": {
+                "resourceAttributes": {
+                    "verb": "get",
+                    "resource": "configmaps",
+                    "namespace": "default"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("allowed SelfSubjectAccessReview completes");
+    assert_eq!(allowed_response.status(), reqwest::StatusCode::OK);
+    let allowed: serde_json::Value = allowed_response
+        .json()
+        .await
+        .expect("allowed SelfSubjectAccessReview is JSON");
+    assert_eq!(allowed["status"]["allowed"], true);
+    assert!(allowed["status"].get("denied").is_none());
+
+    let no_opinion_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-reviewer-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": {
+                "resourceAttributes": {
+                    "verb": "create",
+                    "resource": "pods",
+                    "namespace": "default"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("no-opinion SelfSubjectAccessReview completes");
+    assert_eq!(no_opinion_response.status(), reqwest::StatusCode::OK);
+    let no_opinion: serde_json::Value = no_opinion_response
+        .json()
+        .await
+        .expect("no-opinion SelfSubjectAccessReview is JSON");
+    assert_eq!(no_opinion["status"]["allowed"], false);
+    assert!(no_opinion["status"].get("denied").is_none());
 }
 
 #[tokio::test]

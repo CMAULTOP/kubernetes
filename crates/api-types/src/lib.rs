@@ -14,8 +14,10 @@ pub const NAMESPACE_KIND: &str = "Namespace";
 pub const NODE_KIND: &str = "Node";
 pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
 pub const AUTHENTICATION_V1_API_VERSION: &str = "authentication.k8s.io/v1";
+pub const AUTHORIZATION_V1_API_VERSION: &str = "authorization.k8s.io/v1";
 pub const TOKEN_REQUEST_KIND: &str = "TokenRequest";
 pub const TOKEN_REVIEW_KIND: &str = "TokenReview";
+pub const SELF_SUBJECT_ACCESS_REVIEW_KIND: &str = "SelfSubjectAccessReview";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -120,6 +122,13 @@ impl TypeMeta {
         Self {
             api_version: AUTHENTICATION_V1_API_VERSION.to_owned(),
             kind: TOKEN_REVIEW_KIND.to_owned(),
+        }
+    }
+
+    pub fn self_subject_access_review() -> Self {
+        Self {
+            api_version: AUTHORIZATION_V1_API_VERSION.to_owned(),
+            kind: SELF_SUBJECT_ACCESS_REVIEW_KIND.to_owned(),
         }
     }
 }
@@ -567,6 +576,176 @@ impl TokenReviewUserInfo {
             && self.groups.is_empty()
             && self.extra.is_empty()
     }
+}
+
+/// A create-only authorization.k8s.io/v1 request that evaluates the authenticated caller's own
+/// authorization against exactly one resource or non-resource target.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfSubjectAccessReview {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: SelfSubjectAccessReviewSpec,
+    #[serde(default)]
+    pub status: SubjectAccessReviewStatus,
+}
+
+impl SelfSubjectAccessReview {
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        if !self.type_meta.api_version.is_empty()
+            && self.type_meta.api_version != AUTHORIZATION_V1_API_VERSION
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "apiVersion must be {AUTHORIZATION_V1_API_VERSION}, got {}",
+                    self.type_meta.api_version
+                ),
+            });
+        }
+        if !self.type_meta.kind.is_empty() && self.type_meta.kind != SELF_SUBJECT_ACCESS_REVIEW_KIND
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "kind must be {SELF_SUBJECT_ACCESS_REVIEW_KIND}, got {}",
+                    self.type_meta.kind
+                ),
+            });
+        }
+        self.type_meta = TypeMeta::self_subject_access_review();
+        Ok(())
+    }
+
+    /// Validates client-owned review attributes. The status response is server-owned.
+    pub fn validate_request(&self) -> Result<(), ApiError> {
+        if !self.status.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "status is server-owned and must not be set in a SelfSubjectAccessReview request"
+                    .to_owned(),
+            });
+        }
+        match (
+            self.spec.resource_attributes.as_ref(),
+            self.spec.non_resource_attributes.as_ref(),
+        ) {
+            (Some(resource), None) => resource.validate(),
+            (None, Some(non_resource)) => non_resource.validate(),
+            _ => Err(ApiError::Invalid {
+                message: "exactly one of spec.resourceAttributes or spec.nonResourceAttributes must be set"
+                    .to_owned(),
+            }),
+        }
+    }
+}
+
+/// Target of one self authorization query. Exactly one branch must be populated.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfSubjectAccessReviewSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_attributes: Option<AccessReviewResourceAttributes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_resource_attributes: Option<AccessReviewNonResourceAttributes>,
+}
+
+/// Kubernetes resource request attributes accepted by this access-review slice.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccessReviewResourceAttributes {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verb: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subresource: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+impl AccessReviewResourceAttributes {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.verb.is_empty() || self.resource.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "spec.resourceAttributes requires verb and resource".to_owned(),
+            });
+        }
+        if self.verb.chars().any(char::is_whitespace)
+            || self.resource.chars().any(char::is_whitespace)
+            || self.group.chars().any(char::is_whitespace)
+            || self.version.chars().any(char::is_whitespace)
+            || self.subresource.chars().any(char::is_whitespace)
+            || self.namespace.chars().any(char::is_whitespace)
+            || self.name.chars().any(char::is_whitespace)
+        {
+            return Err(ApiError::Invalid {
+                message: "access review attributes must not contain whitespace".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Non-resource URL request attributes accepted by this access-review slice.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccessReviewNonResourceAttributes {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verb: String,
+}
+
+impl AccessReviewNonResourceAttributes {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.path.is_empty() || !self.path.starts_with('/') || self.verb.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "spec.nonResourceAttributes requires an absolute path and HTTP verb"
+                    .to_owned(),
+            });
+        }
+        if self.verb != self.verb.to_ascii_lowercase()
+            || self.verb.chars().any(char::is_whitespace)
+            || self.path.chars().any(char::is_whitespace)
+        {
+            return Err(ApiError::Invalid {
+                message: "non-resource access review verb must be lower-case and attributes must not contain whitespace"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Server-populated authorization outcome.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectAccessReviewStatus {
+    #[serde(default)]
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub denied: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evaluation_error: String,
+}
+
+impl SubjectAccessReviewStatus {
+    fn is_empty(&self) -> bool {
+        !self.allowed && !self.denied && self.reason.is_empty() && self.evaluation_error.is_empty()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Typed core/v1 ServiceAccount identity object.
