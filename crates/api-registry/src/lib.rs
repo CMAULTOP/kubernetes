@@ -5,7 +5,10 @@
 
 use std::{collections::BTreeSet, error::Error, fmt};
 
-use rusternetes_api_types::{ApiResource, ApiResourceList, ApiVersions, ServerAddressByClientCidr};
+use rusternetes_api_types::{
+    ApiGroup, ApiGroupList, ApiResource, ApiResourceList, ApiVersions, GroupVersionForDiscovery,
+    ServerAddressByClientCidr,
+};
 
 /// Whether a Kubernetes resource lives in a namespace or at cluster scope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,83 +141,97 @@ impl ApiRegistry {
 
     /// The current executable Rusternetes API surface.
     pub fn core_v1() -> Self {
-        Self::try_new(vec![GroupVersionStrategy {
-            group: "",
-            version: "v1",
-            resources: vec![
-                ResourceStrategy {
-                    plural: "configmaps",
-                    singular: "configmap",
-                    kind: "ConfigMap",
-                    scope: ResourceScope::Namespaced,
-                    verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[],
-                },
-                ResourceStrategy {
-                    plural: "pods",
-                    singular: "pod",
-                    kind: "Pod",
-                    scope: ResourceScope::Namespaced,
-                    verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[SubresourceStrategy {
-                        name: "status",
-                        discovery_name: "pods/status",
+        Self::try_new(vec![
+            GroupVersionStrategy {
+                group: "",
+                version: "v1",
+                resources: vec![
+                    ResourceStrategy {
+                        plural: "configmaps",
+                        singular: "configmap",
+                        kind: "ConfigMap",
+                        scope: ResourceScope::Namespaced,
+                        verbs: &["create", "delete", "get", "list", "update", "watch"],
+                        subresources: &[],
+                    },
+                    ResourceStrategy {
+                        plural: "pods",
+                        singular: "pod",
                         kind: "Pod",
-                        verbs: &["get", "update"],
-                    }],
-                },
-                ResourceStrategy {
-                    plural: "serviceaccounts",
-                    singular: "serviceaccount",
-                    kind: "ServiceAccount",
-                    scope: ResourceScope::Namespaced,
-                    verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[SubresourceStrategy {
-                        name: "token",
-                        discovery_name: "serviceaccounts/token",
-                        kind: "TokenRequest",
-                        verbs: &["create"],
-                    }],
-                },
-                ResourceStrategy {
-                    plural: "nodes",
-                    singular: "node",
-                    kind: "Node",
-                    scope: ResourceScope::Cluster,
-                    verbs: &[
-                        "create", "delete", "get", "list", "patch", "update", "watch",
-                    ],
-                    subresources: &[SubresourceStrategy {
-                        name: "status",
-                        discovery_name: "nodes/status",
-                        kind: "Node",
-                        verbs: &["get", "update"],
-                    }],
-                },
-                ResourceStrategy {
-                    plural: "namespaces",
-                    singular: "namespace",
-                    kind: "Namespace",
-                    scope: ResourceScope::Cluster,
-                    verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[
-                        SubresourceStrategy {
+                        scope: ResourceScope::Namespaced,
+                        verbs: &["create", "delete", "get", "list", "update", "watch"],
+                        subresources: &[SubresourceStrategy {
                             name: "status",
-                            discovery_name: "namespaces/status",
-                            kind: "Namespace",
+                            discovery_name: "pods/status",
+                            kind: "Pod",
                             verbs: &["get", "update"],
-                        },
-                        SubresourceStrategy {
-                            name: "finalize",
-                            discovery_name: "namespaces/finalize",
-                            kind: "Namespace",
-                            verbs: &["update"],
-                        },
-                    ],
-                },
-            ],
-        }])
-        .expect("the built-in Rusternetes core/v1 registry is valid")
+                        }],
+                    },
+                    ResourceStrategy {
+                        plural: "serviceaccounts",
+                        singular: "serviceaccount",
+                        kind: "ServiceAccount",
+                        scope: ResourceScope::Namespaced,
+                        verbs: &["create", "delete", "get", "list", "update", "watch"],
+                        subresources: &[SubresourceStrategy {
+                            name: "token",
+                            discovery_name: "serviceaccounts/token",
+                            kind: "TokenRequest",
+                            verbs: &["create"],
+                        }],
+                    },
+                    ResourceStrategy {
+                        plural: "nodes",
+                        singular: "node",
+                        kind: "Node",
+                        scope: ResourceScope::Cluster,
+                        verbs: &[
+                            "create", "delete", "get", "list", "patch", "update", "watch",
+                        ],
+                        subresources: &[SubresourceStrategy {
+                            name: "status",
+                            discovery_name: "nodes/status",
+                            kind: "Node",
+                            verbs: &["get", "update"],
+                        }],
+                    },
+                    ResourceStrategy {
+                        plural: "namespaces",
+                        singular: "namespace",
+                        kind: "Namespace",
+                        scope: ResourceScope::Cluster,
+                        verbs: &["create", "delete", "get", "list", "update", "watch"],
+                        subresources: &[
+                            SubresourceStrategy {
+                                name: "status",
+                                discovery_name: "namespaces/status",
+                                kind: "Namespace",
+                                verbs: &["get", "update"],
+                            },
+                            SubresourceStrategy {
+                                name: "finalize",
+                                discovery_name: "namespaces/finalize",
+                                kind: "Namespace",
+                                verbs: &["update"],
+                            },
+                        ],
+                    },
+                ],
+            },
+            GroupVersionStrategy {
+                group: "authentication.k8s.io",
+                version: "v1",
+                resources: vec![ResourceStrategy {
+                    plural: "tokenreviews",
+                    singular: "tokenreview",
+                    kind: "TokenReview",
+                    scope: ResourceScope::Cluster,
+                    verbs: &["create"],
+                    subresources: &[],
+                }],
+            },
+        ])
+        .expect("the built-in Rusternetes API registry is valid")
     }
 
     /// Produces Kubernetes core discovery strictly from registered core versions.
@@ -232,13 +249,60 @@ impl ApiRegistry {
         }
     }
 
+    /// Produces discovery for all registered non-core API groups.
+    pub fn named_api_groups(&self) -> ApiGroupList {
+        let groups = self
+            .group_versions
+            .iter()
+            .filter(|group_version| !group_version.group.is_empty())
+            .fold(Vec::<ApiGroup>::new(), |mut groups, group_version| {
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.name == group_version.group)
+                {
+                    group.versions.push(GroupVersionForDiscovery {
+                        group_version: format!("{}/{}", group_version.group, group_version.version),
+                        version: group_version.version,
+                    });
+                } else {
+                    let version = GroupVersionForDiscovery {
+                        group_version: format!("{}/{}", group_version.group, group_version.version),
+                        version: group_version.version,
+                    };
+                    groups.push(ApiGroup {
+                        name: group_version.group,
+                        versions: vec![version.clone()],
+                        preferred_version: version,
+                    });
+                }
+                groups
+            });
+        ApiGroupList {
+            kind: "APIGroupList",
+            api_version: "v1",
+            groups,
+        }
+    }
+
+    /// Produces discovery for one registered non-core API group.
+    pub fn named_api_group(&self, name: &str) -> Option<ApiGroup> {
+        self.named_api_groups()
+            .groups
+            .into_iter()
+            .find(|group| group.name == name)
+    }
+
     /// Produces Kubernetes resource discovery for one registered group/version.
     pub fn discovery(&self, group: &str, version: &str) -> Option<ApiResourceList> {
         let group_version = self.group_version(group, version)?;
         Some(ApiResourceList {
             kind: "APIResourceList",
             api_version: "v1",
-            group_version: group_version.version,
+            group_version: if group_version.group.is_empty() {
+                group_version.version.to_owned()
+            } else {
+                format!("{}/{}", group_version.group, group_version.version)
+            },
             resources: group_version
                 .resources
                 .iter()
@@ -261,6 +325,40 @@ impl ApiRegistry {
                     ))
                 })
                 .collect(),
+        })
+    }
+
+    /// Resolves any currently executable API resource path for authorization metadata.
+    pub fn resolve_path(&self, path: &str) -> Option<ResolvedResourcePath> {
+        if path.starts_with("/api/v1") {
+            return self.resolve_core_v1_path(path);
+        }
+        let segments = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let (group, version, plural, name) = match segments.as_slice() {
+            ["apis", group, version, plural] => (*group, *version, *plural, None),
+            ["apis", group, version, plural, name] => (*group, *version, *plural, Some(*name)),
+            _ => return None,
+        };
+        let group_version = self.group_version(group, version)?;
+        let resource = group_version
+            .resources
+            .iter()
+            .find(|resource| resource.plural == plural)?
+            .clone();
+        if matches!(resource.scope, ResourceScope::Namespaced) {
+            return None;
+        }
+        Some(ResolvedResourcePath {
+            group: group_version.group,
+            version: group_version.version,
+            resource,
+            namespace: None,
+            name: name.map(str::to_owned),
+            subresource: None,
         })
     }
 

@@ -15,6 +15,7 @@ pub const NODE_KIND: &str = "Node";
 pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
 pub const AUTHENTICATION_V1_API_VERSION: &str = "authentication.k8s.io/v1";
 pub const TOKEN_REQUEST_KIND: &str = "TokenRequest";
+pub const TOKEN_REVIEW_KIND: &str = "TokenReview";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -112,6 +113,13 @@ impl TypeMeta {
         Self {
             api_version: AUTHENTICATION_V1_API_VERSION.to_owned(),
             kind: TOKEN_REQUEST_KIND.to_owned(),
+        }
+    }
+
+    pub fn token_review() -> Self {
+        Self {
+            api_version: AUTHENTICATION_V1_API_VERSION.to_owned(),
+            kind: TOKEN_REVIEW_KIND.to_owned(),
         }
     }
 }
@@ -439,6 +447,125 @@ pub struct TokenRequestStatus {
 impl TokenRequestStatus {
     fn is_empty(&self) -> bool {
         self.token.is_empty() && self.expiration_timestamp.is_none()
+    }
+}
+
+/// A create-only authentication.k8s.io/v1 online credential authentication request.
+///
+/// TokenReview is not persisted. Its status is populated by the API server after it verifies the
+/// submitted opaque token and applies live Kubernetes object binding checks.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenReview {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: TokenReviewSpec,
+    #[serde(default)]
+    pub status: TokenReviewStatus,
+}
+
+impl TokenReview {
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        if !self.type_meta.api_version.is_empty()
+            && self.type_meta.api_version != AUTHENTICATION_V1_API_VERSION
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "apiVersion must be {AUTHENTICATION_V1_API_VERSION}, got {}",
+                    self.type_meta.api_version
+                ),
+            });
+        }
+        if !self.type_meta.kind.is_empty() && self.type_meta.kind != TOKEN_REVIEW_KIND {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "kind must be {TOKEN_REVIEW_KIND}, got {}",
+                    self.type_meta.kind
+                ),
+            });
+        }
+        self.type_meta = TypeMeta::token_review();
+        Ok(())
+    }
+
+    /// Validates client-owned request fields. `status` is server-owned and must be absent.
+    pub fn validate_request(&self) -> Result<(), ApiError> {
+        if self.spec.token.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "spec.token is required".to_owned(),
+            });
+        }
+        if self.spec.audiences.iter().any(String::is_empty) {
+            return Err(ApiError::Invalid {
+                message: "spec.audiences must not contain empty values".to_owned(),
+            });
+        }
+        if !self.status.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "status is server-owned and must not be set in a TokenReview request"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Opaque bearer token and optional resource-server audiences to evaluate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenReviewSpec {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+}
+
+/// Server-populated outcome of online token authentication.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenReviewStatus {
+    #[serde(default)]
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "TokenReviewUserInfo::is_empty")]
+    pub user: TokenReviewUserInfo,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+impl TokenReviewStatus {
+    fn is_empty(&self) -> bool {
+        !self.authenticated
+            && self.user.is_empty()
+            && self.audiences.is_empty()
+            && self.error.is_empty()
+    }
+}
+
+/// Identity associated with an authenticated TokenReview credential.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenReviewUserInfo {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Vec<String>>,
+}
+
+impl TokenReviewUserInfo {
+    fn is_empty(&self) -> bool {
+        self.username.is_empty()
+            && self.uid.is_empty()
+            && self.groups.is_empty()
+            && self.extra.is_empty()
     }
 }
 
@@ -1776,6 +1903,32 @@ pub struct ApiVersions {
     pub server_address_by_client_cidrs: Vec<ServerAddressByClientCidr>,
 }
 
+/// Discovery document listing served named API groups.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiGroupList {
+    pub kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    pub api_version: &'static str,
+    pub groups: Vec<ApiGroup>,
+}
+
+/// Discovery metadata for one served named Kubernetes API group.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGroup {
+    pub name: &'static str,
+    pub versions: Vec<GroupVersionForDiscovery>,
+    pub preferred_version: GroupVersionForDiscovery,
+}
+
+/// One named group/version in API-group discovery output.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupVersionForDiscovery {
+    pub group_version: String,
+    pub version: &'static str,
+}
+
 /// Discovery address entry retained for Kubernetes API response shape compatibility.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1802,7 +1955,7 @@ pub struct ApiResourceList {
     #[serde(rename = "apiVersion")]
     pub api_version: &'static str,
     #[serde(rename = "groupVersion")]
-    pub group_version: &'static str,
+    pub group_version: String,
     pub resources: Vec<ApiResource>,
 }
 

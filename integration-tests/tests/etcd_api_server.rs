@@ -13,13 +13,16 @@ use rusternetes_admission::{
 };
 use rusternetes_api_server::{
     core_backend_from_etcd_config, router_with_backend_auth_authorization_and_admission,
-    router_with_core_backend, AuthorizationMode, ConfigMapBackend, CoreApiBackend,
+    router_with_core_backend_and_auth, AuthorizationMode, ConfigMapBackend, CoreApiBackend,
 };
 use rusternetes_api_types::{
     ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, Node, ObjectMeta, Pod, PodPhase,
     PodSpec, ServiceAccount, TypeMeta,
 };
-use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
+use rusternetes_authn::{
+    AnonymousPolicy, AuthenticationChain, RequestIdentity, ServiceAccountJwtKey,
+    ServiceAccountJwtVerifier, ServiceAccountTokenIssuer, StaticBearerToken,
+};
 use rusternetes_authz_rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding, RoleRef,
     Subject,
@@ -118,13 +121,20 @@ async fn start_etcd() -> (EphemeralEtcd, String) {
 }
 
 async fn start_core_server(backend: CoreApiBackend) -> TestServer {
+    start_core_server_with_auth(backend, AuthenticationChain::default()).await
+}
+
+async fn start_core_server_with_auth(
+    backend: CoreApiBackend,
+    authentication: AuthenticationChain,
+) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|error| panic!("core HTTP listener binds: {error}"));
     let address = listener
         .local_addr()
         .unwrap_or_else(|error| panic!("core HTTP listener reports address: {error}"));
-    let application = router_with_core_backend(backend);
+    let application = router_with_core_backend_and_auth(backend, authentication);
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, application).await {
             panic!("etcd-backed core API Server fails: {error}");
@@ -1188,6 +1198,141 @@ async fn service_account_api_persists_through_configured_etcd_backend() {
         .await
         .expect("direct etcd read succeeds");
     assert_eq!(persisted, updated);
+}
+
+fn token_review_authentication() -> AuthenticationChain {
+    const PRIVATE_KEY: &str =
+        include_str!("../../crates/api-server/testdata/tokenrequest-test-private.pem");
+    const PUBLIC_KEY: &str =
+        include_str!("../../crates/api-server/testdata/tokenrequest-test-public.pem");
+    let verifier = ServiceAccountJwtVerifier::new(
+        "https://issuer.example",
+        vec!["api".to_owned()],
+        vec![ServiceAccountJwtKey {
+            key_id: Some("tokenreview-etcd-test".to_owned()),
+            rsa_public_key_pem: PUBLIC_KEY.to_owned(),
+        }],
+    )
+    .expect("ServiceAccount JWT verifier is valid");
+    let issuer = ServiceAccountTokenIssuer::new(
+        "https://issuer.example",
+        vec!["api".to_owned()],
+        PRIVATE_KEY,
+        "tokenreview-etcd-test",
+        60,
+        120,
+    )
+    .expect("ServiceAccount JWT issuer is valid");
+    let caller = RequestIdentity::authenticated(
+        "tokenreview-admin",
+        None,
+        ["system:masters".to_owned()],
+        Default::default(),
+    )
+    .expect("TokenReview caller identity is valid");
+    AuthenticationChain::new(
+        AnonymousPolicy::Deny,
+        vec![StaticBearerToken::new("tokenreview-admin-secret", caller)
+            .expect("TokenReview caller token is valid")],
+    )
+    .with_service_account_jwt_verifier(verifier)
+    .with_service_account_token_issuer(issuer)
+    .expect("issuer matches TokenReview verifier")
+}
+
+#[tokio::test]
+async fn token_review_validates_a_durable_serviceaccount_jwt_through_real_etcd() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-tokenreview-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let repository = EtcdServiceAccountRepository::connect(
+        [endpoint.as_str()],
+        Some(&format!("{prefix}/serviceaccounts")),
+    )
+    .await
+    .expect("direct ServiceAccount repository connects");
+    let server = start_core_server_with_auth(backend, token_review_authentication()).await;
+    let client = reqwest::Client::new();
+    let collection = format!(
+        "{}/api/v1/namespaces/default/serviceaccounts",
+        server.base_url
+    );
+    let created_response = client
+        .post(&collection)
+        .header("authorization", "Bearer tokenreview-admin-secret")
+        .json(&ServiceAccount {
+            type_meta: TypeMeta::service_account(),
+            metadata: ObjectMeta {
+                name: Some("review-robot".to_owned()),
+                ..ObjectMeta::default()
+            },
+            ..ServiceAccount::default()
+        })
+        .send()
+        .await
+        .expect("durable ServiceAccount create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: ServiceAccount = created_response
+        .json()
+        .await
+        .expect("created ServiceAccount is typed JSON");
+    let persisted = repository
+        .get("default", "review-robot")
+        .await
+        .expect("created ServiceAccount is durable in etcd");
+    assert_eq!(persisted, created);
+
+    let token_response = client
+        .post(format!("{collection}/review-robot/token"))
+        .header("authorization", "Bearer tokenreview-admin-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": { "audiences": ["api"] }
+        }))
+        .send()
+        .await
+        .expect("durable TokenRequest completes");
+    assert_eq!(token_response.status(), reqwest::StatusCode::OK);
+    let token_response: serde_json::Value = token_response
+        .json()
+        .await
+        .expect("TokenRequest response is JSON");
+    let token = token_response["status"]["token"]
+        .as_str()
+        .expect("TokenRequest returns JWT");
+
+    let review_response = client
+        .post(format!(
+            "{}/apis/authentication.k8s.io/v1/tokenreviews",
+            server.base_url
+        ))
+        .header("authorization", "Bearer tokenreview-admin-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenReview",
+            "spec": { "token": token, "audiences": ["api"] }
+        }))
+        .send()
+        .await
+        .expect("durable TokenReview completes");
+    assert_eq!(review_response.status(), reqwest::StatusCode::OK);
+    let review: serde_json::Value = review_response
+        .json()
+        .await
+        .expect("TokenReview response is JSON");
+    assert_eq!(review["status"]["authenticated"], true);
+    assert_eq!(
+        review["status"]["user"]["username"],
+        "system:serviceaccount:default:review-robot"
+    );
+    assert_eq!(
+        review["status"]["user"]["uid"].as_str(),
+        created.metadata.uid.as_deref()
+    );
+    assert_eq!(review["status"]["audiences"], serde_json::json!(["api"]));
 }
 
 #[tokio::test]

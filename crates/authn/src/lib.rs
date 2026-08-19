@@ -278,6 +278,22 @@ impl ServiceAccountJwtVerifier {
     }
 
     pub fn verify(&self, token: &str) -> Result<VerifiedServiceAccountJwt, ApiError> {
+        self.verify_for_audiences(token, &self.audiences)
+    }
+
+    /// Verifies one ServiceAccount JWT against an explicit non-empty resource-server audience
+    /// set. TokenReview uses this to require audience intersection without reimplementing RS256,
+    /// issuer, time or Kubernetes identity claim validation.
+    pub fn verify_for_audiences(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Result<VerifiedServiceAccountJwt, ApiError> {
+        if audiences.is_empty() || audiences.iter().any(String::is_empty) {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount JWT verification audiences must be non-empty".to_owned(),
+            });
+        }
         let header =
             decode_header(token).map_err(|_| unauthorized("invalid ServiceAccount JWT"))?;
         if header.alg != Algorithm::RS256 {
@@ -298,7 +314,7 @@ impl ServiceAccountJwtVerifier {
                 })?;
             let mut validation = Validation::new(Algorithm::RS256);
             validation.set_issuer(&[self.issuer.as_str()]);
-            validation.set_audience(&self.audiences);
+            validation.set_audience(audiences);
             if let Ok(data) = decode::<VerifiedServiceAccountJwt>(token, &decoding_key, &validation)
             {
                 return validate_service_account_claims(data.claims);

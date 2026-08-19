@@ -21,9 +21,10 @@ use rusternetes_admission::{
 };
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
-    ApiStatus, ConfigMap, ConfigMapList, DeleteOptions, FieldSelector, LabelSelector, Namespace,
-    NamespaceList, NamespacePhase, Node, NodeList, Pod, PodList, ServiceAccount,
-    ServiceAccountList, TokenRequest, TypeMeta,
+    ApiGroup, ApiGroupList, ApiResourceList, ApiStatus, ConfigMap, ConfigMapList, DeleteOptions,
+    FieldSelector, LabelSelector, Namespace, NamespaceList, NamespacePhase, Node, NodeList, Pod,
+    PodList, ServiceAccount, ServiceAccountList, TokenRequest, TokenReview, TokenReviewStatus,
+    TokenReviewUserInfo, TypeMeta,
 };
 use rusternetes_authn::{
     AuthenticationChain, KubernetesBoundObjectClaims, RequestIdentity, ServiceAccountJwksDocument,
@@ -591,6 +592,7 @@ pub struct AppState {
     admission: AdmissionChain,
     service_account_token_issuer: Option<ServiceAccountTokenIssuer>,
     service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
+    token_review_authentication: Option<AuthenticationState>,
     pagination: Arc<PaginationCache>,
 }
 
@@ -617,6 +619,7 @@ impl AppState {
             admission,
             service_account_token_issuer: None,
             service_account_oidc_discovery: None,
+            token_review_authentication: None,
             pagination: Arc::new(PaginationCache::default()),
         }
     }
@@ -721,6 +724,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         pods: state.backend.pods.clone(),
         nodes: state.backend.nodes.clone(),
     };
+    state.token_review_authentication = Some(authentication_state.clone());
     Router::new()
         .route(
             "/.well-known/openid-configuration",
@@ -729,6 +733,13 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route("/openid/v1/jwks", get(service_account_jwks))
         .route("/version", get(version))
         .route("/api", get(api_versions))
+        .route("/apis", get(named_api_groups))
+        .route("/apis/:group", get(named_api_group))
+        .route("/apis/:group/:version", get(named_api_resources))
+        .route(
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            axum::routing::post(create_token_review),
+        )
         .route("/api/v1", get(core_v1_api_resources))
         .route("/api/v1/configmaps", get(list_all_config_maps))
         .route("/api/v1/pods", get(list_all_pods))
@@ -1102,7 +1113,7 @@ fn authorization_request_from_http(
     method: &axum::http::Method,
     uri: &axum::http::Uri,
 ) -> AuthorizationRequest {
-    let Some(resolved) = registry.resolve_core_v1_path(uri.path()) else {
+    let Some(resolved) = registry.resolve_path(uri.path()) else {
         return AuthorizationRequest::non_resource(
             method.as_str().to_ascii_lowercase(),
             uri.path().to_owned(),
@@ -1464,9 +1475,7 @@ async fn api_versions(State(state): State<AppState>) -> Json<rusternetes_api_typ
     Json(state.registry.core_api_versions())
 }
 
-async fn core_v1_api_resources(
-    State(state): State<AppState>,
-) -> Json<rusternetes_api_types::ApiResourceList> {
+async fn core_v1_api_resources(State(state): State<AppState>) -> Json<ApiResourceList> {
     // The route itself exists only because core/v1 is registered by the built-in strategy.
     Json(
         state
@@ -1474,6 +1483,52 @@ async fn core_v1_api_resources(
             .discovery("", "v1")
             .expect("core/v1 API route requires a registered core/v1 strategy"),
     )
+}
+
+async fn named_api_groups(State(state): State<AppState>) -> Json<ApiGroupList> {
+    Json(state.registry.named_api_groups())
+}
+
+async fn named_api_group(
+    State(state): State<AppState>,
+    Path(group): Path<String>,
+) -> ApiResult<Json<ApiGroup>> {
+    state
+        .registry
+        .named_api_group(&group)
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::NotFound {
+                resource: ResourceReference {
+                    group,
+                    resource: "apigroups".to_owned(),
+                    namespace: None,
+                    name: None,
+                },
+            }
+            .into()
+        })
+}
+
+async fn named_api_resources(
+    State(state): State<AppState>,
+    Path((group, version)): Path<(String, String)>,
+) -> ApiResult<Json<ApiResourceList>> {
+    state
+        .registry
+        .discovery(&group, &version)
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::NotFound {
+                resource: ResourceReference {
+                    group,
+                    resource: "apiversions".to_owned(),
+                    namespace: None,
+                    name: Some(version),
+                },
+            }
+            .into()
+        })
 }
 
 async fn list_all_config_maps(
@@ -1721,6 +1776,63 @@ async fn create_service_account_token(
     request.status.token = issued.token;
     request.status.expiration_timestamp = Some(issued.expiration_timestamp);
     Ok(Json(request))
+}
+
+/// Authenticates a presented ServiceAccount JWT without using it as the caller credential.
+///
+/// TokenReview itself is authorized by middleware from the caller's `Authorization` header. The
+/// opaque token in the request body is evaluated independently and failures are represented by a
+/// successful TokenReview response with `status.authenticated == false`.
+async fn create_token_review(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<Json<TokenReview>> {
+    let mut review = decode_token_review(body)?;
+    review.enforce_type_meta()?;
+    review.validate_request()?;
+    let Some(authentication) = state.token_review_authentication.as_ref() else {
+        return Ok(Json(review));
+    };
+    let Some(verifier) = authentication.chain.service_account_jwt_verifier() else {
+        return Ok(Json(review));
+    };
+    let claims = if review.spec.audiences.is_empty() {
+        verifier.verify(&review.spec.token)
+    } else {
+        verifier.verify_for_audiences(&review.spec.token, &review.spec.audiences)
+    };
+    let Ok(claims) = claims else {
+        return Ok(Json(review));
+    };
+    let audiences = review
+        .spec
+        .audiences
+        .iter()
+        .filter(|audience| claims.aud.contains(*audience))
+        .cloned()
+        .collect::<Vec<_>>();
+    let identity = authenticate_live_service_account(
+        &authentication.service_accounts,
+        &authentication.pods,
+        &authentication.nodes,
+        claims,
+    )
+    .await;
+    let Ok(identity) = identity else {
+        return Ok(Json(review));
+    };
+    review.status = TokenReviewStatus {
+        authenticated: true,
+        user: TokenReviewUserInfo {
+            username: identity.username,
+            uid: identity.uid.unwrap_or_default(),
+            groups: identity.groups.into_iter().collect(),
+            extra: identity.extra,
+        },
+        audiences,
+        error: String::new(),
+    };
+    Ok(Json(review))
 }
 
 async fn token_request_bound_claims(
@@ -2489,6 +2601,21 @@ fn decode_token_request(body: Bytes) -> ApiResult<TokenRequest> {
     })
 }
 
+fn decode_token_review(body: Bytes) -> ApiResult<TokenReview> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a TokenReview JSON request body is required".to_owned(),
+        }
+        .into());
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        ApiError::BadRequest {
+            message: format!("invalid TokenReview JSON: {error}"),
+        }
+        .into()
+    })
+}
+
 fn decode_service_account(body: Bytes) -> ApiResult<ServiceAccount> {
     decode_typed_resource(body, "ServiceAccount")
 }
@@ -3130,6 +3257,226 @@ mod tests {
         let claims = verifier.verify(token).expect("issued token verifies");
         assert_eq!(claims.sub, "system:serviceaccount:default:build-robot");
         assert_eq!(claims.aud, ["api"]);
+    }
+
+    async fn issue_token_review_test_token(app: Router) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/serviceaccounts/build-robot/token")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenRequest",
+                            "spec": { "audiences": ["api"] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid TokenRequest"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("TokenRequest body is readable"),
+        )
+        .expect("TokenRequest response is JSON");
+        response["status"]["token"]
+            .as_str()
+            .expect("TokenRequest returns a token")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn token_review_authenticates_live_serviceaccount_jwts_and_advertises_group_discovery() {
+        let (app, _) = configured_token_request_app().await;
+        let token = issue_token_review_test_token(app.clone()).await;
+
+        let groups = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apis")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .body(Body::empty())
+                    .expect("valid group discovery request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(groups.status(), StatusCode::OK);
+        let groups: serde_json::Value = serde_json::from_slice(
+            &to_bytes(groups.into_body(), usize::MAX)
+                .await
+                .expect("group discovery body is readable"),
+        )
+        .expect("group discovery is JSON");
+        assert!(groups["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|group| {
+                group["name"] == "authentication.k8s.io"
+                    && group["preferredVersion"]["groupVersion"] == "authentication.k8s.io/v1"
+            })));
+        let resources = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apis/authentication.k8s.io/v1")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .body(Body::empty())
+                    .expect("valid resource discovery request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(resources.status(), StatusCode::OK);
+        let resources: serde_json::Value = serde_json::from_slice(
+            &to_bytes(resources.into_body(), usize::MAX)
+                .await
+                .expect("resource discovery body is readable"),
+        )
+        .expect("resource discovery is JSON");
+        assert_eq!(resources["groupVersion"], "authentication.k8s.io/v1");
+        assert!(resources["resources"]
+            .as_array()
+            .is_some_and(|resources| resources.iter().any(|resource| resource["name"]
+                == "tokenreviews"
+                && resource["namespaced"] == false
+                && resource["kind"] == "TokenReview"
+                && resource["verbs"] == serde_json::json!(["create"]))));
+
+        let review = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenReview",
+                            "spec": { "token": token, "audiences": ["api"] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid TokenReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(review.status(), StatusCode::OK);
+        let review: serde_json::Value = serde_json::from_slice(
+            &to_bytes(review.into_body(), usize::MAX)
+                .await
+                .expect("TokenReview body is readable"),
+        )
+        .expect("TokenReview response is JSON");
+        assert_eq!(review["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(review["kind"], "TokenReview");
+        assert_eq!(review["status"]["authenticated"], true);
+        assert_eq!(
+            review["status"]["user"]["username"],
+            "system:serviceaccount:default:build-robot"
+        );
+        assert!(review["status"]["user"]["uid"].is_string());
+        assert!(review["status"]["user"]["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|group| group == "system:authenticated")));
+        assert_eq!(review["status"]["audiences"], serde_json::json!(["api"]));
+    }
+
+    #[tokio::test]
+    async fn token_review_fails_closed_for_invalid_or_unconfigured_tokens_and_rejects_client_status(
+    ) {
+        let (app, _) = configured_token_request_app().await;
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenReview",
+                            "spec": { "token": "not-a-jwt" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid invalid-token review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(invalid.status(), StatusCode::OK);
+        let invalid: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invalid.into_body(), usize::MAX)
+                .await
+                .expect("invalid review body is readable"),
+        )
+        .expect("invalid review response is JSON");
+        assert_eq!(invalid["status"]["authenticated"], serde_json::json!(false));
+        assert!(invalid["status"].get("user").is_none());
+
+        let disabled = router_with_backend(ConfigMapBackend::InMemory(Arc::new(
+            InMemoryConfigMapStore::new(),
+        )));
+        let unconfigured = disabled
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenReview",
+                            "spec": { "token": "unconfigured-token" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid unconfigured review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(unconfigured.status(), StatusCode::OK);
+        let unconfigured: serde_json::Value = serde_json::from_slice(
+            &to_bytes(unconfigured.into_body(), usize::MAX)
+                .await
+                .expect("unconfigured review body is readable"),
+        )
+        .expect("unconfigured review response is JSON");
+        assert_eq!(
+            unconfigured["status"]["authenticated"],
+            serde_json::json!(false)
+        );
+
+        let client_status = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenReview",
+                            "spec": { "token": "not-a-jwt" },
+                            "status": { "authenticated": true }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid client-status review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(client_status.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -3987,6 +4334,32 @@ mod tests {
                 && subresource.as_deref() == Some("status")
                 && namespace.is_none()
                 && name.as_deref() == Some("node-a")
+        ));
+    }
+
+    #[test]
+    fn token_review_path_maps_to_authentication_group_create_resource() {
+        let request = authorization_request_from_http(
+            &ApiRegistry::core_v1(),
+            &axum::http::Method::POST,
+            &"/apis/authentication.k8s.io/v1/tokenreviews"
+                .parse()
+                .expect("valid TokenReview URI"),
+        );
+        assert_eq!(request.verb, "create");
+        assert!(matches!(
+            request.target,
+            rusternetes_authz_rbac::RequestTarget::Resource {
+                api_group,
+                resource,
+                subresource,
+                namespace,
+                name,
+            } if api_group == "authentication.k8s.io"
+                && resource == "tokenreviews"
+                && subresource.is_none()
+                && namespace.is_none()
+                && name.is_none()
         ));
     }
 
