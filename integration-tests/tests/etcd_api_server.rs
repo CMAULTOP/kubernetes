@@ -945,6 +945,75 @@ async fn namespace_finalizer_lifecycle_persists_through_configured_etcd_backend(
 }
 
 #[tokio::test]
+async fn pod_finalizer_lifecycle_persists_through_configured_etcd_backend() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let root = format!("/rusternetes-pod-finalizer-http-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&root))
+        .await
+        .expect("durable core backend initializes");
+    let repository = EtcdPodRepository::connect([endpoint.as_str()], Some(&format!("{root}/pods")))
+        .await
+        .expect("direct Pod etcd repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let namespace_name = "finalizer-development";
+    let namespace_response = client
+        .post(format!("{}/api/v1/namespaces", server.base_url))
+        .json(&namespace(namespace_name))
+        .send()
+        .await
+        .expect("Pod finalizer test Namespace creates");
+    assert_eq!(namespace_response.status(), reqwest::StatusCode::CREATED);
+
+    let mut resource = pod("terminating", namespace_name);
+    resource
+        .metadata
+        .finalizers
+        .push("example.com/cleanup".to_owned());
+    let collection = format!(
+        "{}/api/v1/namespaces/{namespace_name}/pods",
+        server.base_url
+    );
+    let created_response = client
+        .post(&collection)
+        .json(&resource)
+        .send()
+        .await
+        .expect("finalizer-bearing Pod creates");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+
+    let delete_response = client
+        .delete(format!("{collection}/terminating"))
+        .send()
+        .await
+        .expect("Pod deletion request completes");
+    assert_eq!(delete_response.status(), reqwest::StatusCode::ACCEPTED);
+    let pending = repository
+        .get(namespace_name, "terminating")
+        .await
+        .expect("deletion-pending Pod is durable");
+    assert!(pending.metadata.deletion_timestamp.is_some());
+    assert_eq!(
+        pending.metadata.finalizers,
+        vec!["example.com/cleanup".to_owned()]
+    );
+    assert_eq!(pending.status.phase, Some(PodPhase::Pending));
+
+    let finalize_response = client
+        .patch(format!("{collection}/terminating"))
+        .header("content-type", "application/json-patch+json")
+        .body(r#"[{"op":"remove","path":"/metadata/finalizers/0"}]"#)
+        .send()
+        .await
+        .expect("Pod finalizer-removal patch completes");
+    assert_eq!(finalize_response.status(), reqwest::StatusCode::OK);
+    assert!(matches!(
+        repository.get(namespace_name, "terminating").await,
+        Err(rusternetes_common::ApiError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn namespace_status_persists_through_configured_etcd_backend_without_spec_mutation() {
     let (_etcd, endpoint) = start_etcd().await;
     let root = format!(

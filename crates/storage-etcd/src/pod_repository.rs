@@ -256,16 +256,26 @@ impl EtcdPodRepository {
             }
         }
         resource.validate_update(&stored.resource)?;
-        resource.preserve_server_metadata_from(&stored.resource, "0".to_owned());
-        let encoded = encode(&resource)?;
+        if stored.resource.metadata.deletion_timestamp.is_some() {
+            resource.preserve_deletion_pending_update_from(&stored.resource, "0".to_owned());
+        } else {
+            resource.preserve_server_metadata_from(&stored.resource, "0".to_owned());
+        }
+        let deletion_completed = stored.resource.metadata.deletion_timestamp.is_some()
+            && resource.metadata.finalizers.is_empty();
         let key = self.pod_key(&namespace, &name)?;
+        let operation = if deletion_completed {
+            TxnOp::delete(key.clone(), None)
+        } else {
+            TxnOp::put(key.clone(), encode(&resource)?, None)
+        };
         let transaction = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
                 CompareOp::Equal,
                 stored.mod_revision,
             )])
-            .and_then(vec![TxnOp::put(key, encoded, None)]);
+            .and_then(vec![operation]);
         let response = self
             .client
             .lock()
@@ -385,6 +395,43 @@ impl EtcdPodRepository {
         let stored = self.get_stored(namespace, name).await?;
         validate_delete_preconditions(&stored.resource, &options, &reference)?;
         let key = self.pod_key(namespace, name)?;
+        if stored.resource.metadata.deletion_timestamp.is_none()
+            && !stored.resource.metadata.finalizers.is_empty()
+        {
+            let mut pending = stored.resource;
+            pending.mark_deletion_requested(OffsetDateTime::now_utc(), "0".to_owned());
+            let transaction = Txn::new()
+                .when(vec![Compare::mod_revision(
+                    key.clone(),
+                    CompareOp::Equal,
+                    stored.mod_revision,
+                )])
+                .and_then(vec![TxnOp::put(key, encode(&pending)?, None)]);
+            let response = self
+                .client
+                .lock()
+                .await
+                .txn(transaction)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            if !response.succeeded() {
+                return Err(ApiError::Conflict {
+                    resource: reference,
+                });
+            }
+            return Ok(DeleteResult {
+                resource_version: response_revision(&response)?,
+            });
+        }
+        if stored.resource.metadata.deletion_timestamp.is_some() {
+            return Ok(DeleteResult {
+                resource_version: stored
+                    .resource
+                    .metadata
+                    .resource_version
+                    .unwrap_or_default(),
+            });
+        }
         let transaction = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
@@ -587,11 +634,6 @@ fn validate_delete_preconditions(
     options: &DeleteOptions,
     reference: &ResourceReference,
 ) -> Result<(), ApiError> {
-    if !resource.metadata.finalizers.is_empty() {
-        return Err(ApiError::BadRequest {
-            message: "deleting resources with finalizers is not implemented in phase 3".to_owned(),
-        });
-    }
     let Some(preconditions) = options.preconditions.as_ref() else {
         return Ok(());
     };

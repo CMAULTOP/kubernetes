@@ -679,6 +679,9 @@ impl Pod {
     /// Applies the immutable fields supported before scheduler and runtime slices exist.
     pub fn validate_update(&self, previous: &Self) -> Result<(), ApiError> {
         self.validate()?;
+        if previous.metadata.deletion_timestamp.is_some() {
+            return self.validate_deletion_pending_update(previous);
+        }
         if self.spec != previous.spec {
             return Err(ApiError::Invalid {
                 message:
@@ -692,6 +695,65 @@ impl Pod {
             });
         }
         Ok(())
+    }
+
+    /// Limits regular updates once deletion has begun to removal of existing finalizers only.
+    fn validate_deletion_pending_update(&self, previous: &Self) -> Result<(), ApiError> {
+        if self.type_meta != previous.type_meta
+            || self.metadata.name != previous.metadata.name
+            || self.metadata.namespace != previous.metadata.namespace
+            || self.metadata.uid != previous.metadata.uid
+            || self.metadata.generation != previous.metadata.generation
+            || self.metadata.creation_timestamp != previous.metadata.creation_timestamp
+            || self.metadata.deletion_timestamp != previous.metadata.deletion_timestamp
+            || self.metadata.labels != previous.metadata.labels
+            || self.metadata.annotations != previous.metadata.annotations
+            || self.metadata.owner_references != previous.metadata.owner_references
+            || self.spec != previous.spec
+            || self.status != previous.status
+        {
+            return Err(ApiError::Invalid {
+                message: "a deletion-pending Pod can only remove existing metadata.finalizers"
+                    .to_owned(),
+            });
+        }
+        if self.metadata.finalizers.len() > previous.metadata.finalizers.len()
+            || self
+                .metadata
+                .finalizers
+                .iter()
+                .any(|finalizer| !previous.metadata.finalizers.contains(finalizer))
+        {
+            return Err(ApiError::Invalid {
+                message: "a deletion-pending Pod can only remove existing metadata.finalizers"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Preserves all stored fields while retaining the finalizer removals accepted for a
+    /// deletion-pending Pod.
+    pub fn preserve_deletion_pending_update_from(
+        &mut self,
+        previous: &Self,
+        resource_version: String,
+    ) {
+        let finalizers = self.metadata.finalizers.clone();
+        self.type_meta = previous.type_meta.clone();
+        self.metadata = previous.metadata.clone();
+        self.metadata.finalizers = finalizers;
+        self.metadata.resource_version = Some(resource_version);
+        self.spec = previous.spec.clone();
+        self.status = previous.status.clone();
+    }
+
+    /// Marks a Pod as deletion-pending without allowing callers to choose the timestamp.
+    pub fn mark_deletion_requested(&mut self, now: OffsetDateTime, resource_version: String) {
+        if self.metadata.deletion_timestamp.is_none() {
+            self.metadata.deletion_timestamp = Some(now);
+            self.metadata.resource_version = Some(resource_version);
+        }
     }
 
     /// Validates and applies one scheduler-owned assignment without exposing general Pod spec mutation.

@@ -249,9 +249,20 @@ impl InMemoryPodStore {
         )?;
         resource.validate_update(&previous)?;
         let resource_version = state.next_resource_version();
-        resource.preserve_server_metadata_from(&previous, resource_version);
-        let event = PodWatchEvent::modified(resource.clone());
-        state.pods.insert(key, resource.clone());
+        if previous.metadata.deletion_timestamp.is_some() {
+            resource.preserve_deletion_pending_update_from(&previous, resource_version);
+        } else {
+            resource.preserve_server_metadata_from(&previous, resource_version);
+        }
+        let deletion_completed = previous.metadata.deletion_timestamp.is_some()
+            && resource.metadata.finalizers.is_empty();
+        let event = if deletion_completed {
+            state.pods.remove(&key);
+            PodWatchEvent::deleted(resource.clone())
+        } else {
+            state.pods.insert(key, resource.clone());
+            PodWatchEvent::modified(resource.clone())
+        };
         let revision = state.revision;
         state.publish(PodHistoryEvent {
             revision,
@@ -355,6 +366,25 @@ impl InMemoryPodStore {
                 resource: key.reference(),
             })?;
         validate_delete(&current.metadata, &options, &key.reference())?;
+        if current.metadata.deletion_timestamp.is_none() && !current.metadata.finalizers.is_empty()
+        {
+            let resource_version = state.next_resource_version();
+            current.mark_deletion_requested(OffsetDateTime::now_utc(), resource_version.clone());
+            let event = PodWatchEvent::modified(current.clone());
+            state.pods.insert(key, current.clone());
+            let revision = state.revision;
+            state.publish(PodHistoryEvent {
+                revision,
+                resource: current,
+                event,
+            });
+            return Ok(DeleteResult { resource_version });
+        }
+        if current.metadata.deletion_timestamp.is_some() {
+            return Ok(DeleteResult {
+                resource_version: current.metadata.resource_version.unwrap_or_default(),
+            });
+        }
         state.pods.remove(&key);
         let resource_version = state.next_resource_version();
         current.metadata.resource_version = Some(resource_version.clone());
@@ -871,11 +901,6 @@ fn validate_delete(
     options: &DeleteOptions,
     reference: &ResourceReference,
 ) -> Result<(), ApiError> {
-    if !metadata.finalizers.is_empty() {
-        return Err(ApiError::BadRequest {
-            message: "deleting resources with finalizers is not implemented in phase 1".to_owned(),
-        });
-    }
     validate_delete_preconditions(metadata, options, reference)
 }
 
@@ -1030,6 +1055,76 @@ mod tests {
             store.update_status(stale).await,
             Err(ApiError::Conflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn pod_finalizer_delete_is_staged_and_regular_update_completes_it() {
+        let store = InMemoryPodStore::new();
+        let mut resource = pod("terminating");
+        resource
+            .metadata
+            .finalizers
+            .push("example.com/cleanup".to_owned());
+        let created = store.create(resource).await.expect("Pod creates");
+        let mut watch = store
+            .watch(PodWatchRequest {
+                namespace: Some("default".to_owned()),
+                resource_version: created.metadata.resource_version.clone(),
+                ..PodWatchRequest::default()
+            })
+            .await
+            .expect("watch starts");
+
+        store
+            .delete("default", "terminating", DeleteOptions::default())
+            .await
+            .expect("deletion request stages the Pod");
+        let pending = store
+            .get("default", "terminating")
+            .await
+            .expect("Pod remains visible while finalizer exists");
+        assert!(pending.metadata.deletion_timestamp.is_some());
+        assert_eq!(
+            pending.metadata.finalizers,
+            vec!["example.com/cleanup".to_owned()]
+        );
+        assert_eq!(
+            watch
+                .recv()
+                .await
+                .expect("deletion request is watched")
+                .event_type,
+            WatchEventType::Modified
+        );
+
+        let mut invalid = pending.clone();
+        invalid
+            .metadata
+            .labels
+            .insert("attempted-mutation".to_owned(), "rejected".to_owned());
+        assert!(matches!(
+            store.update(invalid).await,
+            Err(ApiError::Invalid { .. })
+        ));
+
+        let mut finalize = pending;
+        finalize.metadata.finalizers.clear();
+        store
+            .update(finalize)
+            .await
+            .expect("regular update removing final finalizer completes deletion");
+        assert!(matches!(
+            store.get("default", "terminating").await,
+            Err(ApiError::NotFound { .. })
+        ));
+        assert_eq!(
+            watch
+                .recv()
+                .await
+                .expect("completed deletion is watched")
+                .event_type,
+            WatchEventType::Deleted
+        );
     }
 
     #[tokio::test]

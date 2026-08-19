@@ -1938,9 +1938,11 @@ async fn delete_pod(
     Extension(identity): Extension<RequestIdentity>,
     Path((namespace, name)): Path<(String, String)>,
     body: Bytes,
-) -> ApiResult<Json<ApiStatus>> {
+) -> ApiResult<Response> {
     let options = decode_delete_options(body)?;
     let old_object = state.backend.pods.get(&namespace, &name).await?;
+    let deletion_is_pending = old_object.metadata.deletion_timestamp.is_none()
+        && !old_object.metadata.finalizers.is_empty();
     let admission_request = AdmissionRequest::pod_delete(identity, old_object)?;
     state.admission.validate(&admission_request).await?;
     let result = state
@@ -1948,10 +1950,19 @@ async fn delete_pod(
         .pods
         .delete(&namespace, &name, options)
         .await?;
-    Ok(Json(ApiStatus::success(format!(
-        "pods {name:?} deleted at resourceVersion {}",
-        result.resource_version
-    ))))
+    let status = if deletion_is_pending {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(ApiStatus::success(format!(
+            "pods {name:?} deletion accepted at resourceVersion {}",
+            result.resource_version
+        ))),
+    )
+        .into_response())
 }
 
 async fn list_namespaces(

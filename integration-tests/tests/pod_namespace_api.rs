@@ -149,6 +149,139 @@ async fn service_account_crud_is_executable_with_cas_and_typed_metadata() {
 }
 
 #[tokio::test]
+async fn pod_finalizer_lifecycle_uses_standard_patch_and_put_routes() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/namespaces/default/pods", server.base_url);
+
+    let mut patch_resource = pod("finalizer-patch", None, "example:v1");
+    patch_resource
+        .metadata
+        .finalizers
+        .push("example.com/cleanup".to_owned());
+    let created_response = client
+        .post(&collection)
+        .json(&patch_resource)
+        .send()
+        .await
+        .expect("finalizer-bearing Pod creates");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Pod = created_response
+        .json()
+        .await
+        .expect("typed finalizer-bearing Pod response");
+
+    let delete_response = client
+        .delete(format!("{collection}/finalizer-patch"))
+        .send()
+        .await
+        .expect("staged delete completes");
+    assert_eq!(delete_response.status(), reqwest::StatusCode::ACCEPTED);
+    let delete_status: ApiStatus = delete_response
+        .json()
+        .await
+        .expect("staged delete returns Kubernetes Status");
+    assert_eq!(delete_status.reason, StatusReason::Success);
+
+    let pending_response = client
+        .get(format!("{collection}/finalizer-patch"))
+        .send()
+        .await
+        .expect("terminating Pod get completes");
+    assert_eq!(pending_response.status(), reqwest::StatusCode::OK);
+    let pending: Pod = pending_response
+        .json()
+        .await
+        .expect("terminating Pod remains typed");
+    assert!(pending.metadata.deletion_timestamp.is_some());
+    assert_eq!(pending.metadata.finalizers, created.metadata.finalizers);
+    assert_eq!(pending.status, created.status);
+
+    let rejected_response = client
+        .patch(format!("{collection}/finalizer-patch"))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"metadata":{"labels":{"attempted-mutation":"rejected"}}}"#)
+        .send()
+        .await
+        .expect("invalid terminating mutation completes");
+    assert_eq!(
+        rejected_response.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        response_status(rejected_response).await.reason,
+        StatusReason::Invalid
+    );
+
+    let patch_response = client
+        .patch(format!("{collection}/finalizer-patch"))
+        .header("content-type", "application/json-patch+json")
+        .body(r#"[{"op":"remove","path":"/metadata/finalizers/0"}]"#)
+        .send()
+        .await
+        .expect("finalizer-removal JSON Patch completes");
+    assert_eq!(patch_response.status(), reqwest::StatusCode::OK);
+    let finalized_by_patch: Pod = patch_response
+        .json()
+        .await
+        .expect("finalizer-removal response remains typed");
+    assert!(finalized_by_patch.metadata.finalizers.is_empty());
+    assert!(finalized_by_patch.metadata.deletion_timestamp.is_some());
+    let absent_after_patch = client
+        .get(format!("{collection}/finalizer-patch"))
+        .send()
+        .await
+        .expect("deleted Pod get completes");
+    assert_eq!(absent_after_patch.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let mut put_resource = pod("finalizer-put", None, "example:v1");
+    put_resource
+        .metadata
+        .finalizers
+        .push("example.com/cleanup".to_owned());
+    let put_create_response = client
+        .post(&collection)
+        .json(&put_resource)
+        .send()
+        .await
+        .expect("PUT-finalized Pod creates");
+    assert_eq!(put_create_response.status(), reqwest::StatusCode::CREATED);
+    let _created_for_put: Pod = put_create_response
+        .json()
+        .await
+        .expect("typed PUT-finalized Pod response");
+    let put_delete_response = client
+        .delete(format!("{collection}/finalizer-put"))
+        .send()
+        .await
+        .expect("PUT-finalized staged delete completes");
+    assert_eq!(put_delete_response.status(), reqwest::StatusCode::ACCEPTED);
+    let pending_put_response = client
+        .get(format!("{collection}/finalizer-put"))
+        .send()
+        .await
+        .expect("PUT-finalized terminating Pod get completes");
+    let mut pending_for_put: Pod = pending_put_response
+        .json()
+        .await
+        .expect("typed PUT-finalized terminating Pod");
+    pending_for_put.metadata.finalizers.clear();
+    let put_finalize_response = client
+        .put(format!("{collection}/finalizer-put"))
+        .json(&pending_for_put)
+        .send()
+        .await
+        .expect("finalizer-removal PUT completes");
+    assert_eq!(put_finalize_response.status(), reqwest::StatusCode::OK);
+    let absent_after_put = client
+        .get(format!("{collection}/finalizer-put"))
+        .send()
+        .await
+        .expect("PUT-finalized deleted Pod get completes");
+    assert_eq!(absent_after_put.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn namespace_lifecycle_admission_and_typed_pod_api_are_executable_end_to_end() {
     let server = start_server().await;
     let client = reqwest::Client::new();
