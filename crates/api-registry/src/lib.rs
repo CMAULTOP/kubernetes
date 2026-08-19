@@ -20,6 +20,17 @@ impl ResourceScope {
     }
 }
 
+/// Fixed discovery and authorization metadata for one executable resource subresource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubresourceStrategy {
+    /// URI path component below a named parent resource.
+    pub name: &'static str,
+    /// Kubernetes discovery name, including the parent resource segment.
+    pub discovery_name: &'static str,
+    pub kind: &'static str,
+    pub verbs: &'static [&'static str],
+}
+
 /// Fixed strategy metadata for one executable resource route.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceStrategy {
@@ -28,6 +39,7 @@ pub struct ResourceStrategy {
     pub kind: &'static str,
     pub scope: ResourceScope,
     pub verbs: &'static [&'static str],
+    pub subresources: &'static [SubresourceStrategy],
 }
 
 /// One served API group/version.
@@ -47,6 +59,7 @@ pub struct ResolvedResourcePath {
     pub resource: ResourceStrategy,
     pub namespace: Option<String>,
     pub name: Option<String>,
+    pub subresource: Option<&'static str>,
 }
 
 /// Configuration failure prevents registry construction before an API Server starts.
@@ -135,6 +148,7 @@ impl ApiRegistry {
                     kind: "ConfigMap",
                     scope: ResourceScope::Namespaced,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    subresources: &[],
                 },
                 ResourceStrategy {
                     plural: "pods",
@@ -142,6 +156,7 @@ impl ApiRegistry {
                     kind: "Pod",
                     scope: ResourceScope::Namespaced,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    subresources: &[],
                 },
                 ResourceStrategy {
                     plural: "nodes",
@@ -149,6 +164,12 @@ impl ApiRegistry {
                     kind: "Node",
                     scope: ResourceScope::Cluster,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    subresources: &[SubresourceStrategy {
+                        name: "status",
+                        discovery_name: "nodes/status",
+                        kind: "Node",
+                        verbs: &["get", "update"],
+                    }],
                 },
                 ResourceStrategy {
                     plural: "namespaces",
@@ -156,6 +177,7 @@ impl ApiRegistry {
                     kind: "Namespace",
                     scope: ResourceScope::Cluster,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    subresources: &[],
                 },
             ],
         }])
@@ -187,12 +209,23 @@ impl ApiRegistry {
             resources: group_version
                 .resources
                 .iter()
-                .map(|resource| ApiResource {
-                    name: resource.plural,
-                    singular_name: resource.singular,
-                    namespaced: resource.scope.is_namespaced(),
-                    kind: resource.kind,
-                    verbs: resource.verbs.to_vec(),
+                .flat_map(|resource| {
+                    std::iter::once(ApiResource {
+                        name: resource.plural,
+                        singular_name: resource.singular,
+                        namespaced: resource.scope.is_namespaced(),
+                        kind: resource.kind,
+                        verbs: resource.verbs.to_vec(),
+                    })
+                    .chain(resource.subresources.iter().map(
+                        move |subresource| ApiResource {
+                            name: subresource.discovery_name,
+                            singular_name: "",
+                            namespaced: resource.scope.is_namespaced(),
+                            kind: subresource.kind,
+                            verbs: subresource.verbs.to_vec(),
+                        },
+                    ))
                 })
                 .collect(),
         })
@@ -213,14 +246,15 @@ impl ApiRegistry {
                 .find(|resource| resource.plural == plural)
                 .cloned()
         };
-        let (resource, namespace, name) = match segments.as_slice() {
-            ["api", "v1", plural] => (resolve(plural)?, None, None),
+        let (resource, namespace, name, subresource) = match segments.as_slice() {
+            ["api", "v1", plural] => (resolve(plural)?, None, None, None),
             ["api", "v1", plural, name] => {
                 let resource = resolve(plural)?;
                 (
                     resource.clone(),
                     None,
                     matches!(resource.scope, ResourceScope::Cluster).then(|| (*name).to_owned()),
+                    None,
                 )
             }
             ["api", "v1", "namespaces", namespace, plural] => {
@@ -229,6 +263,7 @@ impl ApiRegistry {
                     resource.clone(),
                     matches!(resource.scope, ResourceScope::Namespaced)
                         .then(|| (*namespace).to_owned()),
+                    None,
                     None,
                 )
             }
@@ -239,6 +274,20 @@ impl ApiRegistry {
                     matches!(resource.scope, ResourceScope::Namespaced)
                         .then(|| (*namespace).to_owned()),
                     matches!(resource.scope, ResourceScope::Namespaced).then(|| (*name).to_owned()),
+                    None,
+                )
+            }
+            ["api", "v1", plural, name, subresource] => {
+                let resource = resolve(plural)?;
+                let subresource = resource
+                    .subresources
+                    .iter()
+                    .find(|strategy| strategy.name == *subresource)?;
+                (
+                    resource.clone(),
+                    None,
+                    matches!(resource.scope, ResourceScope::Cluster).then(|| (*name).to_owned()),
+                    Some(subresource.name),
                 )
             }
             _ => return None,
@@ -254,6 +303,7 @@ impl ApiRegistry {
             resource,
             namespace,
             name,
+            subresource,
         })
     }
 
@@ -273,7 +323,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 4);
+        assert_eq!(discovery.resources.len(), 5);
         assert!(discovery
             .resources
             .iter()
@@ -286,6 +336,11 @@ mod tests {
             .resources
             .iter()
             .any(|resource| resource.name == "nodes" && !resource.namespaced));
+        assert!(discovery.resources.iter().any(|resource| {
+            resource.name == "nodes/status"
+                && !resource.namespaced
+                && resource.verbs == ["get", "update"]
+        }));
         assert!(discovery
             .resources
             .iter()
@@ -304,6 +359,13 @@ mod tests {
         assert_eq!(node.resource.kind, "Node");
         assert_eq!(node.namespace, None);
         assert_eq!(node.name.as_deref(), Some("node-a"));
+
+        let node_status = registry
+            .resolve_core_v1_path("/api/v1/nodes/node-a/status")
+            .expect("cluster-scoped Node status path resolves");
+        assert_eq!(node_status.resource.kind, "Node");
+        assert_eq!(node_status.name.as_deref(), Some("node-a"));
+        assert_eq!(node_status.subresource, Some("status"));
 
         let namespace = registry
             .resolve_core_v1_path("/api/v1/namespaces/development")
@@ -327,6 +389,7 @@ mod tests {
             kind: "Widget",
             scope: ResourceScope::Cluster,
             verbs: &["get"],
+            subresources: &[],
         };
         let duplicate_resource = ApiRegistry::try_new(vec![GroupVersionStrategy {
             group: "example.io",

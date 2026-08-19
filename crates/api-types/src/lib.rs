@@ -604,6 +604,36 @@ impl Node {
         preserve_server_metadata(&mut self.metadata, &previous.metadata, resource_version);
         self.status = previous.status.clone();
     }
+
+    /// Validates the stable identity fields supplied to the dedicated `/status` endpoint.
+    ///
+    /// The status endpoint accepts a full Node object, but only `status` is mutable. The
+    /// persistence layer subsequently restores server-owned metadata and desired state from the
+    /// stored object before committing an optimistic-concurrency guarded replacement.
+    pub fn validate_status_update(&self, previous: &Self) -> Result<(), ApiError> {
+        validate_dns_subdomain("metadata.name", self.name()?, 253)?;
+        if self.metadata.namespace.is_some() {
+            return Err(ApiError::Invalid {
+                message: "Node is cluster-scoped and metadata.namespace must be empty".to_owned(),
+            });
+        }
+        if self.name()? != previous.name()? {
+            return Err(ApiError::Invalid {
+                message: "Node identity is immutable after registration".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Retains only the requested status and advances the shared Node resourceVersion.
+    pub fn preserve_status_update_from(&mut self, previous: &Self, resource_version: String) {
+        let status = self.status.clone();
+        self.type_meta = previous.type_meta.clone();
+        self.metadata = previous.metadata.clone();
+        self.metadata.resource_version = Some(resource_version);
+        self.spec = previous.spec.clone();
+        self.status = status;
+    }
 }
 
 /// Namespace desired state retained before finalizer workflow is implemented.

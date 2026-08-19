@@ -359,6 +359,13 @@ impl NodeBackend {
         }
     }
 
+    async fn update_status(&self, resource: Node) -> Result<Node, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update_status(resource).await,
+            Self::Etcd(repository) => repository.update_status(resource).await,
+        }
+    }
+
     async fn delete(&self, name: &str, options: DeleteOptions) -> Result<DeleteResult, ApiError> {
         match self {
             Self::InMemory(store) => store.delete(name, options).await,
@@ -572,6 +579,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route(
             "/api/v1/nodes/:name",
             get(get_node).put(replace_node).delete(delete_node),
+        )
+        .route(
+            "/api/v1/nodes/:name/status",
+            get(get_node_status).put(replace_node_status),
         )
         .route(
             "/api/v1/namespaces",
@@ -820,7 +831,7 @@ fn authorization_request_from_http(
         verb,
         resolved.group,
         resolved.resource.plural,
-        None,
+        resolved.subresource.map(str::to_owned),
         resolved.namespace,
         resolved.name,
     )
@@ -1211,6 +1222,22 @@ async fn replace_node(
     Ok(Json(state.backend.nodes.update(resource).await?))
 }
 
+async fn get_node_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Node>> {
+    Ok(Json(state.backend.nodes.get(&name).await?))
+}
+
+async fn replace_node_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Node>> {
+    let resource = bind_node_status_update_identity(decode_node(body)?, &name)?;
+    Ok(Json(state.backend.nodes.update_status(resource).await?))
+}
+
 async fn delete_node(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1582,6 +1609,21 @@ fn bind_node_update_identity(resource: Node, name: &str) -> ApiResult<Node> {
     }
 }
 
+/// Ensures a status replacement cannot target a different Node than its URI declares.
+fn bind_node_status_update_identity(resource: Node, name: &str) -> ApiResult<Node> {
+    bind_node_update_identity(resource, name).map_err(|error| match error.0 {
+        ApiError::Invalid { message }
+            if message == "metadata.name is required for a replace request" =>
+        {
+            ApiError::Invalid {
+                message: "metadata.name is required for a status replace request".to_owned(),
+            }
+            .into()
+        }
+        error => ApiRejection(error),
+    })
+}
+
 fn bind_namespace_update_identity(resource: Namespace, name: &str) -> ApiResult<Namespace> {
     match resource.metadata.name.as_deref() {
         Some(body_name) if body_name == name => Ok(resource),
@@ -1629,6 +1671,32 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn node_status_path_maps_to_a_distinct_rbac_subresource() {
+        let request = authorization_request_from_http(
+            &ApiRegistry::core_v1(),
+            &axum::http::Method::PUT,
+            &"/api/v1/nodes/node-a/status"
+                .parse()
+                .expect("valid Node status URI"),
+        );
+        assert_eq!(request.verb, "update");
+        assert!(matches!(
+            request.target,
+            rusternetes_authz_rbac::RequestTarget::Resource {
+                api_group,
+                resource,
+                subresource,
+                namespace,
+                name,
+            } if api_group.is_empty()
+                && resource == "nodes"
+                && subresource.as_deref() == Some("status")
+                && namespace.is_none()
+                && name.as_deref() == Some("node-a")
+        ));
+    }
 
     #[tokio::test]
     async fn core_v1_discovery_is_derived_from_the_registered_strategy() {

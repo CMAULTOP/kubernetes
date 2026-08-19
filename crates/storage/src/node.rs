@@ -227,6 +227,38 @@ impl InMemoryNodeStore {
         Ok(node)
     }
 
+    /// Updates only the status projection of an existing Node under its shared resourceVersion.
+    pub async fn update_status(&self, mut node: Node) -> Result<Node, ApiError> {
+        self.drain_closed_watchers().await;
+        node.enforce_type_meta()?;
+        let name = node.name()?.to_owned();
+        let mut state = self.state.write().await;
+        let previous = state
+            .nodes
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: ResourceReference::node(name.clone()),
+            })?;
+        if node.metadata.resource_version.as_deref()
+            != previous.metadata.resource_version.as_deref()
+        {
+            return Err(ApiError::Conflict {
+                resource: ResourceReference::node(name),
+            });
+        }
+        node.validate_status_update(&previous)?;
+        node.preserve_status_update_from(&previous, state.next_resource_version());
+        state.nodes.insert(node.name()?.to_owned(), node.clone());
+        let revision = state.revision;
+        state.publish(NodeHistoryEvent {
+            revision,
+            resource: node.clone(),
+            event: NodeWatchEvent::modified(node.clone()),
+        });
+        Ok(node)
+    }
+
     pub async fn delete(
         &self,
         name: &str,

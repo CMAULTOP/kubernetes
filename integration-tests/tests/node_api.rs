@@ -88,6 +88,90 @@ async fn node_watch_replays_typed_creation_event_over_http() {
 }
 
 #[tokio::test]
+async fn node_status_subresource_preserves_spec_enforces_cas_and_emits_watch_update() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/nodes", server.base_url);
+    let created_response = client
+        .post(&collection)
+        .json(&node("node-a"))
+        .send()
+        .await
+        .expect("create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Node = created_response.json().await.expect("typed Node response");
+    let resource_version = created
+        .metadata
+        .resource_version
+        .clone()
+        .expect("created Node has resourceVersion");
+
+    let watch_response = client
+        .get(format!(
+            "{collection}?watch=true&resourceVersion={resource_version}"
+        ))
+        .send()
+        .await
+        .expect("watch opens");
+    assert_eq!(watch_response.status(), reqwest::StatusCode::OK);
+    let mut watch = watch_response.bytes_stream();
+
+    let mut status_update = created.clone();
+    status_update.spec.unschedulable = true;
+    status_update
+        .metadata
+        .labels
+        .insert("untrusted".to_owned(), "ignored".to_owned());
+    status_update.status.ready = false;
+    let status_response = client
+        .put(format!("{collection}/node-a/status"))
+        .json(&status_update)
+        .send()
+        .await
+        .expect("status update completes");
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let updated: Node = status_response
+        .json()
+        .await
+        .expect("typed status update response");
+    assert!(!updated.status.ready);
+    assert!(!updated.spec.unschedulable);
+    assert!(!updated.metadata.labels.contains_key("untrusted"));
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let event = watch
+        .next()
+        .await
+        .expect("status update produces a watch event")
+        .expect("watch event payload is valid");
+    let event: serde_json::Value = serde_json::from_slice(&event).expect("watch event is JSON");
+    assert_eq!(event["type"], "MODIFIED");
+    assert_eq!(event["object"]["status"]["ready"], false);
+    assert_eq!(event["object"]["spec"]["unschedulable"], false);
+
+    let status_get = client
+        .get(format!("{collection}/node-a/status"))
+        .send()
+        .await
+        .expect("status get completes");
+    assert_eq!(status_get.status(), reqwest::StatusCode::OK);
+    let observed: Node = status_get.json().await.expect("typed status response");
+    assert_eq!(observed, updated);
+
+    let stale_response = client
+        .put(format!("{collection}/node-a/status"))
+        .json(&created)
+        .send()
+        .await
+        .expect("stale status update completes");
+    assert_eq!(stale_response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(status(stale_response).await.reason, StatusReason::Conflict);
+}
+
+#[tokio::test]
 async fn core_v1_node_crud_is_executable_with_server_owned_status_and_cas() {
     let server = start_server().await;
     let client = reqwest::Client::new();

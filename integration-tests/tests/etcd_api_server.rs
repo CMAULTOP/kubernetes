@@ -16,8 +16,8 @@ use rusternetes_api_server::{
     router_with_core_backend, AuthorizationMode, ConfigMapBackend, CoreApiBackend,
 };
 use rusternetes_api_types::{
-    ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, ObjectMeta, Pod, PodPhase, PodSpec,
-    TypeMeta,
+    ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, Node, ObjectMeta, Pod, PodPhase,
+    PodSpec, TypeMeta,
 };
 use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
 use rusternetes_authz_rbac::{
@@ -25,7 +25,7 @@ use rusternetes_authz_rbac::{
     Subject,
 };
 use rusternetes_common::StatusReason;
-use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdPodRepository};
+use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdNodeRepository, EtcdPodRepository};
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
@@ -219,6 +219,20 @@ fn pod(name: &str, namespace: &str) -> Pod {
     }
 }
 
+fn node(name: &str) -> Node {
+    Node {
+        type_meta: TypeMeta::node(),
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            labels: [("role".to_owned(), "worker".to_owned())]
+                .into_iter()
+                .collect(),
+            ..ObjectMeta::default()
+        },
+        ..Node::default()
+    }
+}
+
 fn config_map(name: &str, namespace: &str, tier: &str) -> ConfigMap {
     ConfigMap {
         type_meta: TypeMeta::config_map(),
@@ -384,6 +398,87 @@ async fn http_crud_uses_real_etcd_storage_without_falling_back_to_memory() {
     assert_eq!(live["type"], "DELETED");
     assert_eq!(live["object"]["metadata"]["name"], "settings");
     assert!(repository.get("default", "settings").await.is_err());
+}
+
+#[tokio::test]
+async fn node_status_update_is_durable_cas_guarded_and_watch_visible() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-node-status/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let nodes = EtcdNodeRepository::connect([endpoint.as_str()], Some(&format!("{prefix}/nodes")))
+        .await
+        .expect("direct Node repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/nodes", server.base_url);
+
+    let created_response = client
+        .post(&collection)
+        .json(&node("node-a"))
+        .send()
+        .await
+        .expect("Node create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Node = created_response.json().await.expect("typed Node response");
+    let resource_version = created
+        .metadata
+        .resource_version
+        .clone()
+        .expect("created Node has resourceVersion");
+
+    let mut watch = client
+        .get(&collection)
+        .query(&[
+            ("watch", "true"),
+            ("resourceVersion", resource_version.as_str()),
+        ])
+        .send()
+        .await
+        .expect("durable Node watch opens");
+    assert_eq!(watch.status(), reqwest::StatusCode::OK);
+
+    let mut status_update = created.clone();
+    status_update.status.ready = false;
+    status_update.spec.unschedulable = true;
+    let update_response = client
+        .put(format!("{collection}/node-a/status"))
+        .json(&status_update)
+        .send()
+        .await
+        .expect("durable status update completes");
+    assert_eq!(update_response.status(), reqwest::StatusCode::OK);
+    let updated: Node = update_response
+        .json()
+        .await
+        .expect("typed status update response");
+    assert!(!updated.status.ready);
+    assert!(!updated.spec.unschedulable);
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let event = watch
+        .chunk()
+        .await
+        .expect("durable status watch event arrives")
+        .expect("durable status watch body has event");
+    let event: serde_json::Value = serde_json::from_slice(&event).expect("watch event is JSON");
+    assert_eq!(event["type"], "MODIFIED");
+    assert_eq!(event["object"]["status"]["ready"], false);
+
+    let persisted = nodes.get("node-a").await.expect("direct etcd Node read");
+    assert_eq!(persisted, updated);
+
+    let stale_response = client
+        .put(format!("{collection}/node-a/status"))
+        .json(&created)
+        .send()
+        .await
+        .expect("stale durable status update completes");
+    assert_eq!(stale_response.status(), reqwest::StatusCode::CONFLICT);
 }
 
 #[tokio::test]
