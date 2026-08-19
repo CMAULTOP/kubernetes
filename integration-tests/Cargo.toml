@@ -15,6 +15,7 @@ idna_adapter.workspace = true
 reqwest.workspace = true
 rusternetes-api-server = { path = "../crates/api-server" }
 rusternetes-api-types = { path = "../crates/api-types" }
+rusternetes-authn = { path = "../crates/authn" }
 rusternetes-common = { path = "../crates/common" }
 rusternetes-storage = { path = "../crates/storage" }
 rusternetes-storage-etcd = { path = "../crates/storage-etcd" }

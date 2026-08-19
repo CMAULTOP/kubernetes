@@ -8,8 +8,9 @@ use std::{
     time::Duration,
 };
 
-use rusternetes_api_server::{router_with_backend, ConfigMapBackend};
+use rusternetes_api_server::{router_with_backend_and_auth, ConfigMapBackend};
 use rusternetes_api_types::{ApiStatus, ConfigMap, ConfigMapList, ObjectMeta, TypeMeta};
+use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
 use rusternetes_common::StatusReason;
 use rusternetes_storage_etcd::EtcdConfigMapRepository;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -101,13 +102,21 @@ async fn start_etcd() -> (EphemeralEtcd, String) {
 }
 
 async fn start_server(repository: Arc<EtcdConfigMapRepository>) -> TestServer {
+    start_server_with_auth(repository, AuthenticationChain::default()).await
+}
+
+async fn start_server_with_auth(
+    repository: Arc<EtcdConfigMapRepository>,
+    authentication: AuthenticationChain,
+) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|error| panic!("HTTP listener binds: {error}"));
     let address = listener
         .local_addr()
         .unwrap_or_else(|error| panic!("HTTP listener reports address: {error}"));
-    let application = router_with_backend(ConfigMapBackend::Etcd(repository));
+    let application =
+        router_with_backend_and_auth(ConfigMapBackend::Etcd(repository), authentication);
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, application).await {
             panic!("etcd-backed API Server fails: {error}");
@@ -337,4 +346,61 @@ async fn http_watch_reports_410_when_etcd_history_is_compacted() {
         .unwrap_or_else(|error| panic!("410 response uses Kubernetes Status JSON: {error}"));
     assert_eq!(status.reason, StatusReason::Expired);
     assert_eq!(status.code, 410);
+}
+
+#[tokio::test]
+async fn http_api_enforces_configured_bearer_authentication_before_etcd_mutation() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-authn/{}", Uuid::new_v4());
+    let repository = Arc::new(
+        EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+            .await
+            .expect("etcd repository connects"),
+    );
+    let identity = RequestIdentity::authenticated(
+        "cluster-bootstrap",
+        Some("bootstrap-uid".to_owned()),
+        ["system:bootstrappers".to_owned()],
+        Default::default(),
+    )
+    .expect("identity is valid");
+    let token = StaticBearerToken::new("bootstrap-secret", identity).expect("token is valid");
+    let server = start_server_with_auth(
+        repository.clone(),
+        AuthenticationChain::new(AnonymousPolicy::Deny, vec![token]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/namespaces/default/configmaps", server.base_url);
+
+    let anonymous = client
+        .post(&collection)
+        .json(&config_map("settings", "default", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("unauthenticated request completes: {error}"));
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let status: ApiStatus = anonymous
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("401 response is Kubernetes Status: {error}"));
+    assert_eq!(status.reason, StatusReason::Unauthorized);
+    assert!(repository.get("default", "settings").await.is_err());
+
+    let created = client
+        .post(&collection)
+        .header("authorization", "Bearer bootstrap-secret")
+        .json(&config_map("settings", "default", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("authenticated request completes: {error}"));
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let invalid = client
+        .get(format!("{collection}/settings"))
+        .header("authorization", "Bearer invalid")
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("invalid bearer request completes: {error}"));
+    assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
 }

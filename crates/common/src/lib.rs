@@ -26,6 +26,8 @@ pub enum StatusReason {
     MethodNotAllowed,
     #[serde(rename = "NotFound")]
     NotFound,
+    #[serde(rename = "Unauthorized")]
+    Unauthorized,
 }
 
 /// A typed reference to the resource named by an API operation.
@@ -73,6 +75,8 @@ pub enum ApiError {
     ResourceExpired { message: String },
     #[error("{resource} not found")]
     NotFound { resource: ResourceReference },
+    #[error("unauthorized: {message}")]
+    Unauthorized { message: String },
     #[error("unsupported HTTP method: {method}")]
     MethodNotAllowed { method: String },
     #[error("internal server error")]
@@ -88,6 +92,7 @@ impl ApiError {
             Self::Invalid { .. } => StatusReason::Invalid,
             Self::ResourceExpired { .. } => StatusReason::Expired,
             Self::NotFound { .. } => StatusReason::NotFound,
+            Self::Unauthorized { .. } => StatusReason::Unauthorized,
             Self::MethodNotAllowed { .. } => StatusReason::MethodNotAllowed,
             Self::Internal => StatusReason::InternalError,
         }
@@ -99,6 +104,7 @@ impl ApiError {
             Self::BadRequest { .. } | Self::Invalid { .. } => 400,
             Self::ResourceExpired { .. } => 410,
             Self::NotFound { .. } => 404,
+            Self::Unauthorized { .. } => 401,
             Self::MethodNotAllowed { .. } => 405,
             Self::Internal => 500,
         }
@@ -112,6 +118,7 @@ impl ApiError {
             Self::BadRequest { .. }
             | Self::Invalid { .. }
             | Self::ResourceExpired { .. }
+            | Self::Unauthorized { .. }
             | Self::MethodNotAllowed { .. }
             | Self::Internal => None,
         }

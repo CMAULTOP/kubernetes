@@ -5,8 +5,9 @@ use std::{io, sync::Arc};
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -15,6 +16,7 @@ use rusternetes_api_types::{
     core_api_versions, core_v1_resources, ApiStatus, ConfigMap, DeleteOptions, FieldSelector,
     LabelSelector,
 };
+use rusternetes_authn::AuthenticationChain;
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
     ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
@@ -139,7 +141,19 @@ pub fn router(store: Arc<InMemoryConfigMapStore>) -> Router {
 }
 
 /// Builds the API Server router with an explicitly selected ConfigMap persistence backend.
+///
+/// The default authentication chain permits the documented anonymous Kubernetes identity. Production
+/// configuration can instead construct [`router_with_backend_and_auth`] with credentials and a
+/// restrictive anonymous policy.
 pub fn router_with_backend(backend: ConfigMapBackend) -> Router {
+    router_with_backend_and_auth(backend, AuthenticationChain::default())
+}
+
+/// Builds the API Server router with explicit storage and authentication implementations.
+pub fn router_with_backend_and_auth(
+    backend: ConfigMapBackend,
+    authentication: AuthenticationChain,
+) -> Router {
     let state = AppState::new(backend);
     Router::new()
         .route("/version", get(version))
@@ -157,6 +171,10 @@ pub fn router_with_backend(backend: ConfigMapBackend) -> Router {
                 .delete(delete_config_map),
         )
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            authentication,
+            authenticate_request,
+        ))
         .with_state(state)
 }
 
@@ -189,6 +207,32 @@ pub async fn backend_from_etcd_config(
     let key_prefix = key_prefix.filter(|value| !value.trim().is_empty());
     let repository = EtcdConfigMapRepository::connect(endpoints, key_prefix).await?;
     Ok(ConfigMapBackend::Etcd(Arc::new(repository)))
+}
+
+async fn authenticate_request(
+    State(authentication): State<AuthenticationChain>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let authorization = match request.headers().get(header::AUTHORIZATION) {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return ApiRejection(ApiError::Unauthorized {
+                    message: "Authorization header is not valid HTTP text".to_owned(),
+                })
+                .into_response()
+            }
+        },
+        None => None,
+    };
+    match authentication.authenticate(authorization) {
+        Ok(identity) => {
+            request.extensions_mut().insert(identity);
+            next.run(request).await
+        }
+        Err(error) => ApiRejection(error).into_response(),
+    }
 }
 
 /// A local response wrapper makes the API error representation available to Axum without
@@ -505,8 +549,14 @@ mod tests {
 
     use axum::{
         body::{to_bytes, Body},
+        extract::Extension,
         http::Request,
+        routing::get,
     };
+    use rusternetes_authn::{
+        AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken,
+    };
+    use rusternetes_common::StatusReason;
     use tower::ServiceExt;
 
     use super::*;
@@ -534,6 +584,100 @@ mod tests {
         let created: ConfigMap = serde_json::from_slice(&bytes)
             .unwrap_or_else(|error| panic!("response is a ConfigMap: {error}"));
         assert_eq!(created.metadata.namespace.as_deref(), Some("default"));
+    }
+
+    fn strict_authentication() -> AuthenticationChain {
+        let identity = RequestIdentity::authenticated(
+            "cluster-bootstrap",
+            Some("bootstrap-uid".to_owned()),
+            ["system:bootstrappers".to_owned()],
+            Default::default(),
+        )
+        .expect("test identity is valid");
+        let token = StaticBearerToken::new("bootstrap-secret", identity)
+            .expect("test bearer credential is valid");
+        AuthenticationChain::new(AnonymousPolicy::Deny, vec![token])
+    }
+
+    async fn identity_handler(Extension(identity): Extension<RequestIdentity>) -> String {
+        identity.username
+    }
+
+    fn identity_test_router(authentication: AuthenticationChain) -> Router {
+        Router::new()
+            .route("/identity", get(identity_handler))
+            .layer(middleware::from_fn_with_state(
+                authentication,
+                authenticate_request,
+            ))
+    }
+
+    #[tokio::test]
+    async fn bearer_authentication_injects_identity_and_rejects_forged_headers() {
+        let authenticated = identity_test_router(strict_authentication())
+            .oneshot(
+                Request::builder()
+                    .uri("/identity")
+                    .header("authorization", "Bearer bootstrap-secret")
+                    .header("x-rusternetes-user", "system:masters")
+                    .body(Body::empty())
+                    .expect("valid authenticated request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(authenticated.status(), StatusCode::OK);
+        let bytes = to_bytes(authenticated.into_body(), usize::MAX)
+            .await
+            .expect("identity response body is readable");
+        assert_eq!(bytes.as_ref(), b"cluster-bootstrap");
+
+        let forged = identity_test_router(strict_authentication())
+            .oneshot(
+                Request::builder()
+                    .uri("/identity")
+                    .header("x-rusternetes-user", "system:masters")
+                    .body(Body::empty())
+                    .expect("valid unauthenticated request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+        let bytes = to_bytes(forged.into_body(), usize::MAX)
+            .await
+            .expect("unauthorized response body is readable");
+        let status: ApiStatus =
+            serde_json::from_slice(&bytes).expect("unauthorized response is Kubernetes Status");
+        assert_eq!(status.reason, StatusReason::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_is_unauthorized_and_default_policy_is_explicitly_anonymous() {
+        let rejected = identity_test_router(strict_authentication())
+            .oneshot(
+                Request::builder()
+                    .uri("/identity")
+                    .header("authorization", "Bearer incorrect")
+                    .body(Body::empty())
+                    .expect("valid invalid-token request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let anonymous = identity_test_router(AuthenticationChain::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/identity")
+                    .body(Body::empty())
+                    .expect("valid anonymous request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(anonymous.status(), StatusCode::OK);
+        let bytes = to_bytes(anonymous.into_body(), usize::MAX)
+            .await
+            .expect("anonymous response body is readable");
+        assert_eq!(bytes.as_ref(), b"system:anonymous");
     }
 
     #[tokio::test]
