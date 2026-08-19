@@ -510,21 +510,51 @@ async fn node_patch_is_durable_and_preserves_status_projection() {
     let patch_response = client
         .patch(format!("{collection}/node-a"))
         .header("content-type", "application/merge-patch+json")
-        .body(r#"{"spec":{"unschedulable":true},"status":{"ready":false}}"#)
+        .body(
+            r#"{"metadata":{"labels":{"topology.kubernetes.io/zone":"east-a"}},"spec":{"unschedulable":true},"status":{"ready":false}}"#,
+        )
         .send()
         .await
         .expect("durable Node PATCH completes");
     assert_eq!(patch_response.status(), reqwest::StatusCode::OK);
     let patched: Node = patch_response.json().await.expect("typed PATCH response");
     assert!(patched.spec.unschedulable);
+    assert_eq!(
+        patched.metadata.labels.get("topology.kubernetes.io/zone"),
+        Some(&"east-a".to_owned())
+    );
     assert!(patched.status.ready);
     assert_ne!(
         patched.metadata.resource_version,
         created.metadata.resource_version
     );
 
+    let json_patch_response = client
+        .patch(format!("{collection}/node-a"))
+        .header("content-type", "application/json-patch+json")
+        .body(
+            r#"[{"op":"replace","path":"/metadata/labels/topology.kubernetes.io~1zone","value":"east-b"}]"#,
+        )
+        .send()
+        .await
+        .expect("durable Node JSON Patch completes");
+    assert_eq!(json_patch_response.status(), reqwest::StatusCode::OK);
+    let json_patched: Node = json_patch_response
+        .json()
+        .await
+        .expect("typed JSON Patch response");
+    assert_eq!(
+        json_patched
+            .metadata
+            .labels
+            .get("topology.kubernetes.io/zone"),
+        Some(&"east-b".to_owned())
+    );
+    assert!(json_patched.spec.unschedulable);
+    assert!(json_patched.status.ready);
+
     let persisted = nodes.get("node-a").await.expect("direct etcd Node read");
-    assert_eq!(persisted, patched);
+    assert_eq!(persisted, json_patched);
 }
 
 #[tokio::test]

@@ -122,7 +122,9 @@ async fn node_patch_supports_rfc_merge_and_json_patch_without_bypassing_status_o
             "content-type",
             "application/merge-patch+json; charset=utf-8",
         )
-        .body(r#"{"spec":{"unschedulable":true},"status":{"ready":false}}"#)
+        .body(
+            r#"{"metadata":{"labels":{"topology.kubernetes.io/zone":"east-a"}},"spec":{"unschedulable":true},"status":{"ready":false}}"#,
+        )
         .send()
         .await
         .expect("merge patch completes");
@@ -132,6 +134,10 @@ async fn node_patch_supports_rfc_merge_and_json_patch_without_bypassing_status_o
         .await
         .expect("typed merge patch response");
     assert!(merged.spec.unschedulable);
+    assert_eq!(
+        merged.metadata.labels.get("topology.kubernetes.io/zone"),
+        Some(&"east-a".to_owned())
+    );
     assert!(merged.status.ready);
     assert_ne!(
         merged.metadata.resource_version,
@@ -146,6 +152,10 @@ async fn node_patch_supports_rfc_merge_and_json_patch_without_bypassing_status_o
     let event: serde_json::Value = serde_json::from_slice(&event).expect("watch event is JSON");
     assert_eq!(event["type"], "MODIFIED");
     assert_eq!(event["object"]["spec"]["unschedulable"], true);
+    assert_eq!(
+        event["object"]["metadata"]["labels"]["topology.kubernetes.io/zone"],
+        "east-a"
+    );
     assert_eq!(event["object"]["status"]["ready"], true);
 
     let json_patch_response = client
