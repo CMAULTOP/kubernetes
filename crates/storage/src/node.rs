@@ -2,11 +2,22 @@
 
 use std::collections::BTreeMap;
 
-use rusternetes_api_types::{Node, Pod};
+use rusternetes_api_types::{DeleteOptions, FieldSelector, LabelSelector, Node, NodeList, Pod};
 use rusternetes_common::{ApiError, ResourceReference};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+use crate::DeleteResult;
+
+/// Selector and resume options for a cluster-scoped Node watch subscription.
+#[derive(Clone, Debug, Default)]
+pub struct NodeWatchRequest {
+    pub label_selector: LabelSelector,
+    pub field_selector: FieldSelector,
+    pub resource_version: Option<String>,
+    pub allow_bookmarks: bool,
+}
 
 /// Typed in-memory Node registration storage. Node identity is linearized per name; heartbeats
 /// require the observed resourceVersion and never permit an identity/UID replacement.
@@ -53,6 +64,10 @@ impl InMemoryNodeStore {
         Ok(node)
     }
 
+    pub async fn create(&self, node: Node) -> Result<Node, ApiError> {
+        self.register(node).await
+    }
+
     pub async fn get(&self, name: &str) -> Result<Node, ApiError> {
         self.state
             .read()
@@ -63,6 +78,76 @@ impl InMemoryNodeStore {
             .ok_or_else(|| ApiError::NotFound {
                 resource: ResourceReference::node(name.to_owned()),
             })
+    }
+
+    pub async fn update(&self, mut node: Node) -> Result<Node, ApiError> {
+        node.enforce_type_meta()?;
+        let name = node.name()?.to_owned();
+        let mut state = self.state.write().await;
+        let previous = state
+            .nodes
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: ResourceReference::node(name.clone()),
+            })?;
+        if node.metadata.resource_version.as_deref()
+            != previous.metadata.resource_version.as_deref()
+        {
+            return Err(ApiError::Conflict {
+                resource: ResourceReference::node(name),
+            });
+        }
+        node.validate_update(&previous)?;
+        node.preserve_server_metadata_from(&previous, state.next_resource_version());
+        state.nodes.insert(node.name()?.to_owned(), node.clone());
+        Ok(node)
+    }
+
+    pub async fn delete(
+        &self,
+        name: &str,
+        options: DeleteOptions,
+    ) -> Result<DeleteResult, ApiError> {
+        let mut state = self.state.write().await;
+        let current = state
+            .nodes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: ResourceReference::node(name.to_owned()),
+            })?;
+        if let Some(preconditions) = options.preconditions {
+            if preconditions.uid.is_some() && preconditions.uid != current.metadata.uid
+                || preconditions.resource_version.is_some()
+                    && preconditions.resource_version != current.metadata.resource_version
+            {
+                return Err(ApiError::Conflict {
+                    resource: ResourceReference::node(name.to_owned()),
+                });
+            }
+        }
+        state.nodes.remove(name);
+        Ok(DeleteResult {
+            resource_version: state.next_resource_version(),
+        })
+    }
+
+    pub async fn list_filtered(
+        &self,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> NodeList {
+        let state = self.state.read().await;
+        let items = state
+            .nodes
+            .values()
+            .filter(|node| {
+                label_selector.matches(&node.metadata.labels) && field_selector.matches_node(node)
+            })
+            .cloned()
+            .collect();
+        NodeList::new(state.revision.to_string(), items)
     }
 
     /// Confirms that the reporting agent owns the node and atomically advances its liveness version.

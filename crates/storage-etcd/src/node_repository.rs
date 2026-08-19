@@ -1,4 +1,4 @@
-//! Durable etcd v3 persistence for namespaced ConfigMaps.
+//! Durable etcd v3 persistence for noded Nodes.
 //!
 //! This crate deliberately delegates KV, transactions and transport to `etcd-client`. It owns
 //! only the Kubernetes-specific mapping: key layout, JSON encoding, resourceVersion translation,
@@ -10,11 +10,10 @@ use etcd_client::{
     Compare, CompareOp, EventType as EtcdEventType, GetOptions, Txn, TxnOp, WatchOptions,
 };
 use rusternetes_api_types::{
-    ConfigMap, ConfigMapList, ConfigMapWatchEvent, ConfigMapWatchObject, DeleteOptions,
-    FieldSelector, LabelSelector,
+    DeleteOptions, FieldSelector, LabelSelector, Node, NodeList, NodeWatchEvent, NodeWatchObject,
 };
 use rusternetes_common::{ApiError, ResourceReference};
-use rusternetes_storage::{ConfigMapWatchRequest, DeleteResult};
+use rusternetes_storage::{DeleteResult, NodeWatchRequest};
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, Mutex},
@@ -22,52 +21,45 @@ use tokio::{
 };
 use uuid::Uuid;
 
-mod namespace_repository;
-mod node_repository;
-mod pod_repository;
-pub use namespace_repository::{EtcdNamespaceRepository, EtcdNamespaceWatchSubscription};
-pub use node_repository::{EtcdNodeRepository, EtcdNodeWatchSubscription};
-pub use pod_repository::{EtcdPodRepository, EtcdPodWatchSubscription};
-
-const DEFAULT_PREFIX: &str = "/registry/configmaps";
+const DEFAULT_PREFIX: &str = "/registry/nodes";
 const WATCH_CHANNEL_CAPACITY: usize = 256;
 
-/// Durable repository mapping one ConfigMap to one etcd key.
+/// Durable repository mapping one Node to one etcd key.
 ///
 /// `etcd-client::Client` requires mutable access. The single mutex is therefore the transport
 /// boundary only; it does not protect Kubernetes resource state or emulate a storage database.
-pub struct EtcdConfigMapRepository {
+pub struct EtcdNodeRepository {
     client: Arc<Mutex<etcd_client::Client>>,
     key_prefix: String,
 }
 
-struct StoredConfigMap {
-    resource: ConfigMap,
+struct StoredNode {
+    resource: Node,
     mod_revision: i64,
 }
 
-/// A bounded, cancellation-safe durable ConfigMap WATCH subscription backed by etcd.
+/// A bounded, cancellation-safe durable Node WATCH subscription backed by etcd.
 ///
 /// Dropping the subscription aborts its bridge task, releases the gRPC watch stream and closes the
 /// bounded channel. No caller can cause unbounded per-watch buffering in the API Server.
-pub struct EtcdConfigMapWatchSubscription {
-    receiver: mpsc::Receiver<rusternetes_api_types::ConfigMapWatchEvent>,
+pub struct EtcdNodeWatchSubscription {
+    receiver: mpsc::Receiver<rusternetes_api_types::NodeWatchEvent>,
     bridge_task: JoinHandle<()>,
 }
 
-impl EtcdConfigMapWatchSubscription {
-    pub async fn recv(&mut self) -> Option<rusternetes_api_types::ConfigMapWatchEvent> {
+impl EtcdNodeWatchSubscription {
+    pub async fn recv(&mut self) -> Option<rusternetes_api_types::NodeWatchEvent> {
         self.receiver.recv().await
     }
 }
 
-impl Drop for EtcdConfigMapWatchSubscription {
+impl Drop for EtcdNodeWatchSubscription {
     fn drop(&mut self) {
         self.bridge_task.abort();
     }
 }
 
-impl EtcdConfigMapRepository {
+impl EtcdNodeRepository {
     /// Connects to etcd and validates the key prefix chosen for this API group/resource mapping.
     pub async fn connect(
         endpoints: impl IntoIterator<Item = impl AsRef<str>>,
@@ -87,13 +79,12 @@ impl EtcdConfigMapRepository {
         })
     }
 
-    pub async fn create(&self, mut resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+    pub async fn create(&self, mut resource: Node) -> Result<Node, ApiError> {
         resource.enforce_type_meta()?;
-        resource.validate()?;
-        let namespace = resource.namespace()?.to_owned();
+        resource.validate_create()?;
         let name = resource.name()?.to_owned();
-        let reference = ResourceReference::config_map(namespace.clone(), name.clone());
-        let key = self.config_map_key(&namespace, &name)?;
+        let reference = ResourceReference::node(name.clone());
+        let key = self.node_key(&name)?;
 
         resource.set_create_metadata(
             Uuid::new_v4().to_string(),
@@ -120,30 +111,15 @@ impl EtcdConfigMapRepository {
         Ok(resource)
     }
 
-    pub async fn get(&self, namespace: &str, name: &str) -> Result<ConfigMap, ApiError> {
-        Ok(self.get_stored(namespace, name).await?.resource)
+    pub async fn get(&self, name: &str) -> Result<Node, ApiError> {
+        Ok(self.get_stored(name).await?.resource)
     }
 
     pub async fn list(
         &self,
-        namespace: &str,
         label_selector: &LabelSelector,
         field_selector: &FieldSelector,
-    ) -> Result<ConfigMapList, ApiError> {
-        self.list_prefix(
-            format!("{}/", self.namespace_prefix(namespace)?),
-            label_selector,
-            field_selector,
-        )
-        .await
-    }
-
-    /// Lists ConfigMaps from every namespace under this repository's dedicated etcd prefix.
-    pub async fn list_all(
-        &self,
-        label_selector: &LabelSelector,
-        field_selector: &FieldSelector,
-    ) -> Result<ConfigMapList, ApiError> {
+    ) -> Result<NodeList, ApiError> {
         self.list_prefix(
             format!("{}/", self.key_prefix),
             label_selector,
@@ -152,20 +128,17 @@ impl EtcdConfigMapRepository {
         .await
     }
 
-    /// Opens a bounded ConfigMap watch that replays etcd history and continues with live events.
+    /// Opens a bounded Node watch that replays etcd history and continues with live events.
     ///
     /// A requested historical revision is checked before the HTTP layer starts its response. If
     /// etcd has compacted it, callers receive typed Kubernetes `410 Expired` instead of a stream
     /// that would falsely imply continuity.
     pub async fn watch(
         &self,
-        request: ConfigMapWatchRequest,
-    ) -> Result<EtcdConfigMapWatchSubscription, ApiError> {
+        request: NodeWatchRequest,
+    ) -> Result<EtcdNodeWatchSubscription, ApiError> {
         let requested_revision = parse_watch_resource_version(request.resource_version.as_deref())?;
-        let prefix = match request.namespace.as_deref() {
-            Some(namespace) => format!("{}/", self.namespace_prefix(namespace)?),
-            None => format!("{}/", self.key_prefix),
-        };
+        let prefix = format!("{}/", self.key_prefix);
 
         if let Some(revision) = requested_revision {
             // etcd treats revision 0 as a current read, while Kubernetes resourceVersion=0 asks
@@ -204,7 +177,7 @@ impl EtcdConfigMapRepository {
                         Ok(Some(event)) => event,
                         Ok(None) | Err(_) => continue,
                     };
-                    let ConfigMapWatchObject::ConfigMap(resource) = &translated.object else {
+                    let NodeWatchObject::Node(resource) = &translated.object else {
                         continue;
                     };
                     if !watch_matches(&request, resource) {
@@ -218,7 +191,7 @@ impl EtcdConfigMapRepository {
                 }
             }
         });
-        Ok(EtcdConfigMapWatchSubscription {
+        Ok(EtcdNodeWatchSubscription {
             receiver,
             bridge_task,
         })
@@ -237,17 +210,16 @@ impl EtcdConfigMapRepository {
             .map_err(map_etcd_watch_error)
     }
 
-    /// Replaces a ConfigMap through an atomic mod-revision comparison.
+    /// Replaces a Node through an atomic mod-revision comparison.
     ///
-    /// Kubernetes ConfigMap permits an empty resourceVersion. The repository still reads the
+    /// Kubernetes Node permits an empty resourceVersion. The repository still reads the
     /// current object and compares its observed etcd revision, so the write never becomes blind.
-    pub async fn update(&self, mut resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+    pub async fn update(&self, mut resource: Node) -> Result<Node, ApiError> {
         resource.enforce_type_meta()?;
-        let namespace = resource.namespace()?.to_owned();
         let name = resource.name()?.to_owned();
-        let reference = ResourceReference::config_map(namespace.clone(), name.clone());
+        let reference = ResourceReference::node(name.clone());
         let requested_version = resource.metadata.resource_version.clone();
-        let stored = self.get_stored(&namespace, &name).await?;
+        let stored = self.get_stored(&name).await?;
 
         if let Some(requested_version) = requested_version {
             if requested_version
@@ -266,7 +238,7 @@ impl EtcdConfigMapRepository {
         resource.validate_update(&stored.resource)?;
         resource.preserve_server_metadata_from(&stored.resource, "0".to_owned());
         let encoded = encode(&resource)?;
-        let key = self.config_map_key(&namespace, &name)?;
+        let key = self.node_key(&name)?;
         let transaction = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
@@ -292,14 +264,13 @@ impl EtcdConfigMapRepository {
 
     pub async fn delete(
         &self,
-        namespace: &str,
         name: &str,
         options: DeleteOptions,
     ) -> Result<DeleteResult, ApiError> {
-        let reference = ResourceReference::config_map(namespace.to_owned(), name.to_owned());
-        let stored = self.get_stored(namespace, name).await?;
+        let reference = ResourceReference::node(name);
+        let stored = self.get_stored(name).await?;
         validate_delete_preconditions(&stored.resource, &options, &reference)?;
-        let key = self.config_map_key(namespace, name)?;
+        let key = self.node_key(name)?;
         let transaction = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
@@ -329,7 +300,7 @@ impl EtcdConfigMapRepository {
         prefix: String,
         label_selector: &LabelSelector,
         field_selector: &FieldSelector,
-    ) -> Result<ConfigMapList, ApiError> {
+    ) -> Result<NodeList, ApiError> {
         let response = self
             .client
             .lock()
@@ -346,15 +317,15 @@ impl EtcdConfigMapRepository {
             .into_iter()
             .filter(|resource| {
                 label_selector.matches(&resource.metadata.labels)
-                    && field_selector.matches(resource)
+                    && field_selector.matches_node(resource)
             })
             .collect();
-        Ok(ConfigMapList::new(revision, items))
+        Ok(NodeList::new(revision, items))
     }
 
-    async fn get_stored(&self, namespace: &str, name: &str) -> Result<StoredConfigMap, ApiError> {
-        let reference = ResourceReference::config_map(namespace.to_owned(), name.to_owned());
-        let key = self.config_map_key(namespace, name)?;
+    async fn get_stored(&self, name: &str) -> Result<StoredNode, ApiError> {
+        let reference = ResourceReference::node(name);
+        let key = self.node_key(name)?;
         let response = self
             .client
             .lock()
@@ -366,20 +337,15 @@ impl EtcdConfigMapRepository {
             resource: reference,
         })?;
         let mod_revision = key_value.mod_revision();
-        Ok(StoredConfigMap {
+        Ok(StoredNode {
             resource: decode(key_value.value(), mod_revision)?,
             mod_revision,
         })
     }
 
-    fn config_map_key(&self, namespace: &str, name: &str) -> Result<String, ApiError> {
+    fn node_key(&self, name: &str) -> Result<String, ApiError> {
         validate_key_component("name", name)?;
-        Ok(format!("{}/{name}", self.namespace_prefix(namespace)?))
-    }
-
-    fn namespace_prefix(&self, namespace: &str) -> Result<String, ApiError> {
-        validate_key_component("namespace", namespace)?;
-        Ok(format!("{}/{}", self.key_prefix, namespace))
+        Ok(format!("{}/{name}", self.key_prefix))
     }
 }
 
@@ -411,32 +377,26 @@ fn map_etcd_watch_error(error: etcd_client::Error) -> ApiError {
     }
 }
 
-fn watch_matches(request: &ConfigMapWatchRequest, resource: &ConfigMap) -> bool {
-    request
-        .namespace
-        .as_deref()
-        .is_none_or(|namespace| resource.metadata.namespace.as_deref() == Some(namespace))
-        && request.label_selector.matches(&resource.metadata.labels)
-        && request.field_selector.matches(resource)
+fn watch_matches(request: &NodeWatchRequest, resource: &Node) -> bool {
+    request.label_selector.matches(&resource.metadata.labels)
+        && request.field_selector.matches_node(resource)
 }
 
-fn translate_watch_event(
-    event: &etcd_client::Event,
-) -> Result<Option<ConfigMapWatchEvent>, ApiError> {
+fn translate_watch_event(event: &etcd_client::Event) -> Result<Option<NodeWatchEvent>, ApiError> {
     let key_value = event.kv().ok_or(ApiError::Internal)?;
     match event.event_type() {
         EtcdEventType::Put => {
             let resource = decode(key_value.value(), key_value.mod_revision())?;
             if key_value.version() == 1 {
-                Ok(Some(ConfigMapWatchEvent::added(resource)))
+                Ok(Some(NodeWatchEvent::added(resource)))
             } else {
-                Ok(Some(ConfigMapWatchEvent::modified(resource)))
+                Ok(Some(NodeWatchEvent::modified(resource)))
             }
         }
         EtcdEventType::Delete => {
             let previous = event.prev_kv().ok_or(ApiError::Internal)?;
             let resource = decode(previous.value(), key_value.mod_revision())?;
-            Ok(Some(ConfigMapWatchEvent::deleted(resource)))
+            Ok(Some(NodeWatchEvent::deleted(resource)))
         }
     }
 }
@@ -460,12 +420,12 @@ fn validate_key_component(kind: &str, value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn encode(resource: &ConfigMap) -> Result<Vec<u8>, ApiError> {
+fn encode(resource: &Node) -> Result<Vec<u8>, ApiError> {
     serde_json::to_vec(resource).map_err(|_| ApiError::Internal)
 }
 
-fn decode(raw: &[u8], mod_revision: i64) -> Result<ConfigMap, ApiError> {
-    let mut resource = serde_json::from_slice::<ConfigMap>(raw).map_err(|_| ApiError::Internal)?;
+fn decode(raw: &[u8], mod_revision: i64) -> Result<Node, ApiError> {
+    let mut resource = serde_json::from_slice::<Node>(raw).map_err(|_| ApiError::Internal)?;
     resource.enforce_type_meta()?;
     resource.metadata.resource_version = Some(resource_version(mod_revision)?);
     Ok(resource)
@@ -500,7 +460,7 @@ fn resource_version(revision: i64) -> Result<String, ApiError> {
 }
 
 fn validate_delete_preconditions(
-    resource: &ConfigMap,
+    resource: &Node,
     options: &DeleteOptions,
     reference: &ResourceReference,
 ) -> Result<(), ApiError> {
@@ -533,9 +493,9 @@ mod tests {
 
     #[test]
     fn key_layout_rejects_ambiguous_components() {
-        assert!(normalize_prefix("registry/configmaps").is_err());
-        assert!(normalize_prefix("/registry/configmaps/").is_err());
-        assert!(validate_key_component("namespace", "default/other").is_err());
+        assert!(normalize_prefix("registry/nodes").is_err());
+        assert!(normalize_prefix("/registry/nodes/").is_err());
+        assert!(validate_key_component("node", "default/other").is_err());
         assert!(validate_key_component("name", "").is_err());
     }
 

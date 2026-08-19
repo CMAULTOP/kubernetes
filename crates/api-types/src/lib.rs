@@ -564,6 +564,46 @@ impl Node {
         self.metadata.resource_version = Some(resource_version);
         self.status.ready = true;
     }
+
+    pub fn validate_create(&self) -> Result<(), ApiError> {
+        self.validate_registration()
+    }
+
+    pub fn set_create_metadata(
+        &mut self,
+        uid: String,
+        now: OffsetDateTime,
+        resource_version: String,
+    ) {
+        self.set_registration_metadata(uid, now, resource_version);
+    }
+
+    pub fn validate_update(&self, previous: &Self) -> Result<(), ApiError> {
+        validate_dns_subdomain("metadata.name", self.name()?, 253)?;
+        if self.metadata.namespace.is_some() {
+            return Err(ApiError::Invalid {
+                message: "Node is cluster-scoped and metadata.namespace must be empty".to_owned(),
+            });
+        }
+        validate_object_labels(&self.metadata.labels)?;
+        if self.name()? != previous.name()? || self.metadata.uid != previous.metadata.uid {
+            return Err(ApiError::Invalid {
+                message: "Node identity is immutable after registration".to_owned(),
+            });
+        }
+        if self.status != previous.status {
+            return Err(ApiError::Invalid {
+                message: "Node status is server-owned; use the future /status subresource"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn preserve_server_metadata_from(&mut self, previous: &Self, resource_version: String) {
+        preserve_server_metadata(&mut self.metadata, &previous.metadata, resource_version);
+        self.status = previous.status.clone();
+    }
 }
 
 /// Namespace desired state retained before finalizer workflow is implemented.
@@ -1166,6 +1206,10 @@ impl FieldSelector {
         self.matches_metadata(&resource.metadata)
     }
 
+    pub fn matches_node(&self, resource: &Node) -> bool {
+        self.matches_metadata(&resource.metadata)
+    }
+
     fn matches_metadata(&self, metadata: &ObjectMeta) -> bool {
         self.requirements.iter().all(|requirement| {
             let (field, expected, is_inequality) = match requirement {
@@ -1604,5 +1648,70 @@ mod tests {
             FieldSelector::parse(Some("spec.nodeName=worker-a")),
             Err(ApiError::Invalid { .. })
         ));
+    }
+}
+
+/// Typed Node list response for cluster-scoped Node storage.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeList {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ListMeta,
+    pub items: Vec<Node>,
+}
+
+impl NodeList {
+    pub fn new(resource_version: String, items: Vec<Node>) -> Self {
+        Self {
+            type_meta: TypeMeta::node_list(),
+            metadata: ListMeta {
+                resource_version: Some(resource_version),
+            },
+            items,
+        }
+    }
+}
+
+/// Kubernetes JSON WATCH object for a Node resource.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum NodeWatchObject {
+    Node(Node),
+    Status(ApiStatus),
+}
+
+/// Kubernetes JSON WATCH envelope for Node events.
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeWatchEvent {
+    #[serde(rename = "type")]
+    pub event_type: WatchEventType,
+    pub object: NodeWatchObject,
+}
+
+impl NodeWatchEvent {
+    pub fn added(resource: Node) -> Self {
+        Self {
+            event_type: WatchEventType::Added,
+            object: NodeWatchObject::Node(resource),
+        }
+    }
+    pub fn modified(resource: Node) -> Self {
+        Self {
+            event_type: WatchEventType::Modified,
+            object: NodeWatchObject::Node(resource),
+        }
+    }
+    pub fn deleted(resource: Node) -> Self {
+        Self {
+            event_type: WatchEventType::Deleted,
+            object: NodeWatchObject::Node(resource),
+        }
+    }
+    pub fn bookmark(resource_version: String) -> Self {
+        Self {
+            event_type: WatchEventType::Bookmark,
+            object: NodeWatchObject::Status(ApiStatus::success(resource_version)),
+        }
     }
 }

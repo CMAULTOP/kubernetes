@@ -144,6 +144,13 @@ impl ApiRegistry {
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
                 },
                 ResourceStrategy {
+                    plural: "nodes",
+                    singular: "node",
+                    kind: "Node",
+                    scope: ResourceScope::Cluster,
+                    verbs: &["create", "delete", "get", "list", "update"],
+                },
+                ResourceStrategy {
                     plural: "namespaces",
                     singular: "namespace",
                     kind: "Namespace",
@@ -266,7 +273,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 3);
+        assert_eq!(discovery.resources.len(), 4);
         assert!(discovery
             .resources
             .iter()
@@ -278,6 +285,10 @@ mod tests {
         assert!(discovery
             .resources
             .iter()
+            .any(|resource| resource.name == "nodes" && !resource.namespaced));
+        assert!(discovery
+            .resources
+            .iter()
             .any(|resource| resource.name == "namespaces" && !resource.namespaced));
 
         let route = registry
@@ -286,6 +297,13 @@ mod tests {
         assert_eq!(route.resource.kind, "ConfigMap");
         assert_eq!(route.namespace.as_deref(), Some("development"));
         assert_eq!(route.name.as_deref(), Some("settings"));
+
+        let node = registry
+            .resolve_core_v1_path("/api/v1/nodes/node-a")
+            .expect("cluster-scoped Node path resolves");
+        assert_eq!(node.resource.kind, "Node");
+        assert_eq!(node.namespace, None);
+        assert_eq!(node.name.as_deref(), Some("node-a"));
 
         let namespace = registry
             .resolve_core_v1_path("/api/v1/namespaces/development")
