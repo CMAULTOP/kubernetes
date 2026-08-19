@@ -12,16 +12,20 @@ use rusternetes_admission::{
     AdmissionChain, NamespaceLifecyclePlugin, NamespacePhase, StaticNamespaceStateReader,
 };
 use rusternetes_api_server::{
-    router_with_backend_auth_authorization_and_admission, AuthorizationMode, ConfigMapBackend,
+    core_backend_from_etcd_config, router_with_backend_auth_authorization_and_admission,
+    router_with_core_backend, AuthorizationMode, ConfigMapBackend, CoreApiBackend,
 };
-use rusternetes_api_types::{ApiStatus, ConfigMap, ConfigMapList, ObjectMeta, TypeMeta};
+use rusternetes_api_types::{
+    ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, ObjectMeta, Pod, PodPhase, PodSpec,
+    TypeMeta,
+};
 use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
 use rusternetes_authz_rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding, RoleRef,
     Subject,
 };
 use rusternetes_common::StatusReason;
-use rusternetes_storage_etcd::EtcdConfigMapRepository;
+use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdPodRepository};
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
@@ -110,6 +114,25 @@ async fn start_etcd() -> (EphemeralEtcd, String) {
     panic!("ephemeral etcd accepts real KV operations before timeout");
 }
 
+async fn start_core_server(backend: CoreApiBackend) -> TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|error| panic!("core HTTP listener binds: {error}"));
+    let address = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("core HTTP listener reports address: {error}"));
+    let application = router_with_core_backend(backend);
+    let task = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, application).await {
+            panic!("etcd-backed core API Server fails: {error}");
+        }
+    });
+    TestServer {
+        base_url: format!("http://{address}"),
+        task,
+    }
+}
+
 async fn start_server(repository: Arc<EtcdConfigMapRepository>) -> TestServer {
     start_server_with_auth(repository, AuthenticationChain::default()).await
 }
@@ -162,6 +185,37 @@ async fn start_server_with_authorization_and_admission(
     TestServer {
         base_url: format!("http://{address}"),
         task,
+    }
+}
+
+fn namespace(name: &str) -> Namespace {
+    Namespace {
+        type_meta: TypeMeta::namespace(),
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            ..ObjectMeta::default()
+        },
+        ..Namespace::default()
+    }
+}
+
+fn pod(name: &str, namespace: &str) -> Pod {
+    Pod {
+        type_meta: TypeMeta::pod(),
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            ..ObjectMeta::default()
+        },
+        spec: PodSpec {
+            containers: vec![Container {
+                name: "app".to_owned(),
+                image: Some("example:v1".to_owned()),
+                ..Container::default()
+            }],
+            ..PodSpec::default()
+        },
+        ..Pod::default()
     }
 }
 
@@ -600,4 +654,55 @@ async fn http_admission_rejects_rbac_authorized_create_in_missing_namespace_befo
         .unwrap_or_else(|error| panic!("active namespace create completes: {error}"));
     assert_eq!(allowed.status(), reqwest::StatusCode::CREATED);
     assert!(repository.get("development", "settings").await.is_ok());
+}
+
+#[tokio::test]
+async fn http_core_backend_persists_pods_in_real_etcd_without_memory_fallback() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let root = format!("/rusternetes-core-http-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&root))
+        .await
+        .unwrap_or_else(|error| panic!("all-resource etcd backend initializes: {error}"));
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+
+    let namespace_response = client
+        .post(format!("{}/api/v1/namespaces", server.base_url))
+        .json(&namespace("development"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("Namespace create completes: {error}"));
+    assert_eq!(namespace_response.status(), reqwest::StatusCode::CREATED);
+
+    let pod_response = client
+        .post(format!(
+            "{}/api/v1/namespaces/development/pods",
+            server.base_url
+        ))
+        .json(&pod("web", "development"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("Pod create completes: {error}"));
+    assert_eq!(pod_response.status(), reqwest::StatusCode::CREATED);
+    let created: Pod = pod_response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("Pod create response is typed JSON: {error}"));
+    assert_eq!(created.status.phase, Some(PodPhase::Pending));
+    assert!(created
+        .metadata
+        .resource_version
+        .as_deref()
+        .is_some_and(|value| value.parse::<u64>().is_ok_and(|revision| revision > 0)));
+
+    let pod_prefix = format!("{root}/pods");
+    let repository = EtcdPodRepository::connect([endpoint.as_str()], Some(&pod_prefix))
+        .await
+        .unwrap_or_else(|error| panic!("direct Pod etcd repository connects: {error}"));
+    let persisted = repository
+        .get("development", "web")
+        .await
+        .unwrap_or_else(|error| panic!("Pod is durable in real etcd: {error}"));
+    assert_eq!(persisted.metadata.name.as_deref(), Some("web"));
+    assert_eq!(persisted.status.phase, Some(PodPhase::Pending));
 }

@@ -15,6 +15,12 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
+mod pod_namespace;
+pub use pod_namespace::{
+    InMemoryNamespaceStore, InMemoryPodStore, NamespaceWatchRequest, NamespaceWatchSubscription,
+    PodWatchRequest, PodWatchSubscription,
+};
+
 /// Maximum retained ConfigMap events in the single-process history window.
 pub const WATCH_HISTORY_CAPACITY: usize = 256;
 const WATCHER_CHANNEL_CAPACITY: usize = WATCH_HISTORY_CAPACITY + 1;

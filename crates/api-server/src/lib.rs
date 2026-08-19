@@ -12,17 +12,28 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rusternetes_admission::{AdmissionChain, AdmissionRequest};
+use rusternetes_admission::{
+    AdmissionChain, AdmissionRequest, NamespaceLifecyclePlugin,
+    NamespacePhase as AdmissionNamespacePhase, NamespaceStateReader,
+};
 use rusternetes_api_registry::ApiRegistry;
-use rusternetes_api_types::{ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector};
+use rusternetes_api_types::{
+    ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
+    Pod,
+};
 use rusternetes_authn::{AuthenticationChain, RequestIdentity};
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
     ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
-    DeleteResult, InMemoryConfigMapStore,
+    DeleteResult, InMemoryConfigMapStore, InMemoryNamespaceStore, InMemoryPodStore,
+    NamespaceWatchRequest, NamespaceWatchSubscription as InMemoryNamespaceWatchSubscription,
+    PodWatchRequest, PodWatchSubscription as InMemoryPodWatchSubscription,
 };
-use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdConfigMapWatchSubscription};
+use rusternetes_storage_etcd::{
+    EtcdConfigMapRepository, EtcdConfigMapWatchSubscription, EtcdNamespaceRepository,
+    EtcdNamespaceWatchSubscription, EtcdPodRepository, EtcdPodWatchSubscription,
+};
 use serde::{Deserialize, Serialize};
 
 /// The ConfigMap persistence implementation selected when building an API Server router.
@@ -123,10 +134,241 @@ impl ConfigMapBackend {
     }
 }
 
-/// Shared immutable application state. The selected backend remains the sole owner of data.
+/// The Pod persistence implementation selected alongside the ConfigMap backend.
+#[derive(Clone)]
+pub enum PodBackend {
+    InMemory(Arc<InMemoryPodStore>),
+    Etcd(Arc<EtcdPodRepository>),
+}
+
+pub enum PodWatchSubscription {
+    InMemory(InMemoryPodWatchSubscription),
+    Etcd(EtcdPodWatchSubscription),
+}
+
+impl PodWatchSubscription {
+    async fn recv(&mut self) -> Option<rusternetes_api_types::PodWatchEvent> {
+        match self {
+            Self::InMemory(subscription) => subscription.recv().await,
+            Self::Etcd(subscription) => subscription.recv().await,
+        }
+    }
+}
+
+impl PodBackend {
+    async fn create(&self, resource: Pod) -> Result<Pod, ApiError> {
+        match self {
+            Self::InMemory(store) => store.create(resource).await,
+            Self::Etcd(repository) => repository.create(resource).await,
+        }
+    }
+
+    async fn get(&self, namespace: &str, name: &str) -> Result<Pod, ApiError> {
+        match self {
+            Self::InMemory(store) => store.get(namespace, name).await,
+            Self::Etcd(repository) => repository.get(namespace, name).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        namespace: Option<&str>,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<rusternetes_api_types::PodList, ApiError> {
+        match (self, namespace) {
+            (Self::InMemory(store), namespace) => {
+                Ok(store.list(namespace, label_selector, field_selector).await)
+            }
+            (Self::Etcd(repository), Some(namespace)) => {
+                repository
+                    .list(namespace, label_selector, field_selector)
+                    .await
+            }
+            (Self::Etcd(repository), None) => {
+                repository.list_all(label_selector, field_selector).await
+            }
+        }
+    }
+
+    async fn update(&self, resource: Pod) -> Result<Pod, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update(resource).await,
+            Self::Etcd(repository) => repository.update(resource).await,
+        }
+    }
+
+    async fn delete(
+        &self,
+        namespace: &str,
+        name: &str,
+        options: DeleteOptions,
+    ) -> Result<DeleteResult, ApiError> {
+        match self {
+            Self::InMemory(store) => store.delete(namespace, name, options).await,
+            Self::Etcd(repository) => repository.delete(namespace, name, options).await,
+        }
+    }
+
+    async fn watch(&self, request: PodWatchRequest) -> Result<PodWatchSubscription, ApiError> {
+        match self {
+            Self::InMemory(store) => store
+                .watch(request)
+                .await
+                .map(PodWatchSubscription::InMemory),
+            Self::Etcd(repository) => repository
+                .watch(request)
+                .await
+                .map(PodWatchSubscription::Etcd),
+        }
+    }
+}
+
+/// The cluster-scoped Namespace persistence implementation selected with other core/v1 stores.
+#[derive(Clone)]
+pub enum NamespaceBackend {
+    InMemory(Arc<InMemoryNamespaceStore>),
+    Etcd(Arc<EtcdNamespaceRepository>),
+}
+
+pub enum NamespaceWatchSubscription {
+    InMemory(InMemoryNamespaceWatchSubscription),
+    Etcd(EtcdNamespaceWatchSubscription),
+}
+
+impl NamespaceWatchSubscription {
+    async fn recv(&mut self) -> Option<rusternetes_api_types::NamespaceWatchEvent> {
+        match self {
+            Self::InMemory(subscription) => subscription.recv().await,
+            Self::Etcd(subscription) => subscription.recv().await,
+        }
+    }
+}
+
+impl NamespaceBackend {
+    async fn create(&self, resource: Namespace) -> Result<Namespace, ApiError> {
+        match self {
+            Self::InMemory(store) => store.create(resource).await,
+            Self::Etcd(repository) => repository.create(resource).await,
+        }
+    }
+
+    async fn get(&self, name: &str) -> Result<Namespace, ApiError> {
+        match self {
+            Self::InMemory(store) => store.get(name).await,
+            Self::Etcd(repository) => repository.get(name).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<rusternetes_api_types::NamespaceList, ApiError> {
+        match self {
+            Self::InMemory(store) => Ok(store.list(label_selector, field_selector).await),
+            Self::Etcd(repository) => repository.list(label_selector, field_selector).await,
+        }
+    }
+
+    async fn update(&self, resource: Namespace) -> Result<Namespace, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update(resource).await,
+            Self::Etcd(repository) => repository.update(resource).await,
+        }
+    }
+
+    async fn delete(&self, name: &str, options: DeleteOptions) -> Result<DeleteResult, ApiError> {
+        match self {
+            Self::InMemory(store) => store.delete(name, options).await,
+            Self::Etcd(repository) => repository.delete(name, options).await,
+        }
+    }
+
+    async fn watch(
+        &self,
+        request: NamespaceWatchRequest,
+    ) -> Result<NamespaceWatchSubscription, ApiError> {
+        match self {
+            Self::InMemory(store) => store
+                .watch(request)
+                .await
+                .map(NamespaceWatchSubscription::InMemory),
+            Self::Etcd(repository) => repository
+                .watch(request)
+                .await
+                .map(NamespaceWatchSubscription::Etcd),
+        }
+    }
+}
+
+/// All typed core/v1 persistence backends supplied to an executable API Server.
+#[derive(Clone)]
+pub struct CoreApiBackend {
+    pub config_maps: ConfigMapBackend,
+    pub pods: PodBackend,
+    pub namespaces: NamespaceBackend,
+}
+
+/// Adapts the selected typed Namespace repository to the admission lifecycle contract.
+#[derive(Clone)]
+pub struct BackendNamespaceStateReader {
+    backend: NamespaceBackend,
+}
+
+impl BackendNamespaceStateReader {
+    pub fn new(backend: NamespaceBackend) -> Self {
+        Self { backend }
+    }
+}
+
+impl NamespaceStateReader for BackendNamespaceStateReader {
+    fn phase<'a>(
+        &'a self,
+        namespace: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<AdmissionNamespacePhase, ApiError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            match self.backend.get(namespace).await {
+                Ok(resource) => match resource.status.phase {
+                    Some(NamespacePhase::Terminating) => Ok(AdmissionNamespacePhase::Terminating),
+                    Some(NamespacePhase::Active) | None => Ok(AdmissionNamespacePhase::Active),
+                },
+                Err(ApiError::NotFound { .. }) => Ok(AdmissionNamespacePhase::Missing),
+                Err(error) => Err(error),
+            }
+        })
+    }
+}
+
+/// Builds the fail-closed NamespaceLifecycle admission stage backed by the selected namespace store.
+pub fn namespace_lifecycle_admission(backend: NamespaceBackend) -> AdmissionChain {
+    AdmissionChain::new(vec![Arc::new(NamespaceLifecyclePlugin::new(Arc::new(
+        BackendNamespaceStateReader::new(backend),
+    )))])
+}
+
+impl CoreApiBackend {
+    pub fn in_memory(config_maps: Arc<InMemoryConfigMapStore>) -> Self {
+        Self::legacy(ConfigMapBackend::InMemory(config_maps))
+    }
+
+    fn legacy(config_maps: ConfigMapBackend) -> Self {
+        Self {
+            config_maps,
+            pods: PodBackend::InMemory(Arc::new(InMemoryPodStore::new())),
+            namespaces: NamespaceBackend::InMemory(Arc::new(InMemoryNamespaceStore::new())),
+        }
+    }
+}
+
+/// Shared immutable application state. Every typed resource backend remains the sole owner of data.
 #[derive(Clone)]
 pub struct AppState {
-    backend: ConfigMapBackend,
+    backend: CoreApiBackend,
     registry: ApiRegistry,
     authorization: AuthorizationMode,
     admission: AdmissionChain,
@@ -135,7 +377,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(backend: ConfigMapBackend) -> Self {
         Self::with_registry_authorization_and_admission(
-            backend,
+            CoreApiBackend::legacy(backend),
             ApiRegistry::core_v1(),
             AuthorizationMode::default(),
             AdmissionChain::default(),
@@ -143,7 +385,7 @@ impl AppState {
     }
 
     pub fn with_registry_authorization_and_admission(
-        backend: ConfigMapBackend,
+        backend: CoreApiBackend,
         registry: ApiRegistry,
         authorization: AuthorizationMode,
         admission: AdmissionChain,
@@ -219,6 +461,21 @@ pub fn router_with_backend_auth_authorization_and_admission(
     authorization: AuthorizationMode,
     admission: AdmissionChain,
 ) -> Router {
+    router_with_core_backend_auth_authorization_and_admission(
+        CoreApiBackend::legacy(backend),
+        authentication,
+        authorization,
+        admission,
+    )
+}
+
+/// Builds the API Server router with explicit typed core/v1 storage implementations.
+pub fn router_with_core_backend_auth_authorization_and_admission(
+    backend: CoreApiBackend,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
+    admission: AdmissionChain,
+) -> Router {
     let state = AppState::with_registry_authorization_and_admission(
         backend,
         ApiRegistry::core_v1(),
@@ -230,6 +487,17 @@ pub fn router_with_backend_auth_authorization_and_admission(
         .route("/api", get(api_versions))
         .route("/api/v1", get(core_v1_api_resources))
         .route("/api/v1/configmaps", get(list_all_config_maps))
+        .route("/api/v1/pods", get(list_all_pods))
+        .route(
+            "/api/v1/namespaces",
+            get(list_namespaces).post(create_namespace),
+        )
+        .route(
+            "/api/v1/namespaces/:name",
+            get(get_namespace)
+                .put(replace_namespace)
+                .delete(delete_namespace),
+        )
         .route(
             "/api/v1/namespaces/:namespace/configmaps",
             get(list_config_maps).post(create_config_map),
@@ -239,6 +507,14 @@ pub fn router_with_backend_auth_authorization_and_admission(
             get(get_config_map)
                 .put(replace_config_map)
                 .delete(delete_config_map),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/pods",
+            get(list_pods).post(create_pod),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/pods/:name",
+            get(get_pod).put(replace_pod).delete(delete_pod),
         )
         .fallback(not_found)
         // Axum applies the last layer first. Authentication must populate extensions before RBAC
@@ -252,6 +528,18 @@ pub fn router_with_backend_auth_authorization_and_admission(
             authenticate_request,
         ))
         .with_state(state)
+}
+
+/// Builds a router over all typed core/v1 backends with a lifecycle admission reader bound to the
+/// same Namespace repository.
+pub fn router_with_core_backend(backend: CoreApiBackend) -> Router {
+    let admission = namespace_lifecycle_admission(backend.namespaces.clone());
+    router_with_core_backend_auth_authorization_and_admission(
+        backend,
+        AuthenticationChain::default(),
+        AuthorizationMode::default(),
+        admission,
+    )
 }
 
 /// Selects an API Server backend from optional process configuration values.
@@ -283,6 +571,77 @@ pub async fn backend_from_etcd_config(
     let key_prefix = key_prefix.filter(|value| !value.trim().is_empty());
     let repository = EtcdConfigMapRepository::connect(endpoints, key_prefix).await?;
     Ok(ConfigMapBackend::Etcd(Arc::new(repository)))
+}
+
+/// Selects all executable core/v1 repositories atomically from process configuration.
+///
+/// A configured etcd endpoint must initialize ConfigMap, Pod, and Namespace repositories together;
+/// any connection or prefix failure aborts startup rather than producing a mixed durable/volatile
+/// control plane. The prefix is the core-v1 registry root, with per-resource paths below it.
+pub async fn core_backend_from_etcd_config(
+    endpoints: Option<&str>,
+    key_prefix: Option<&str>,
+) -> Result<CoreApiBackend, ApiError> {
+    let Some(raw_endpoints) = endpoints.filter(|value| !value.trim().is_empty()) else {
+        let backend = CoreApiBackend::in_memory(Arc::new(InMemoryConfigMapStore::new()));
+        ensure_default_namespace(&backend.namespaces).await?;
+        return Ok(backend);
+    };
+    let endpoints = raw_endpoints
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "RUSTERNETES_ETCD_ENDPOINTS must contain at least one non-empty endpoint"
+                .to_owned(),
+        });
+    }
+    let root = key_prefix
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/registry");
+    let config_maps_prefix = core_resource_prefix(root, "configmaps")?;
+    let pods_prefix = core_resource_prefix(root, "pods")?;
+    let namespaces_prefix = core_resource_prefix(root, "namespaces")?;
+    let config_maps =
+        EtcdConfigMapRepository::connect(endpoints.clone(), Some(&config_maps_prefix)).await?;
+    let pods = EtcdPodRepository::connect(endpoints.clone(), Some(&pods_prefix)).await?;
+    let namespaces = EtcdNamespaceRepository::connect(endpoints, Some(&namespaces_prefix)).await?;
+    let backend = CoreApiBackend {
+        config_maps: ConfigMapBackend::Etcd(Arc::new(config_maps)),
+        pods: PodBackend::Etcd(Arc::new(pods)),
+        namespaces: NamespaceBackend::Etcd(Arc::new(namespaces)),
+    };
+    ensure_default_namespace(&backend.namespaces).await?;
+    Ok(backend)
+}
+
+fn core_resource_prefix(root: &str, resource: &str) -> Result<String, ApiError> {
+    let root = root.trim();
+    if !root.starts_with('/') || root.ends_with('/') || root.contains('\0') {
+        return Err(ApiError::BadRequest {
+            message: "RUSTERNETES_ETCD_PREFIX must start with '/', must not end with '/', and must not contain NUL"
+                .to_owned(),
+        });
+    }
+    Ok(format!("{root}/{resource}"))
+}
+
+async fn ensure_default_namespace(backend: &NamespaceBackend) -> Result<(), ApiError> {
+    let namespace = Namespace {
+        type_meta: rusternetes_api_types::TypeMeta::namespace(),
+        metadata: rusternetes_api_types::ObjectMeta {
+            name: Some("default".to_owned()),
+            ..rusternetes_api_types::ObjectMeta::default()
+        },
+        ..Namespace::default()
+    };
+    match backend.create(namespace).await {
+        Ok(_) | Err(ApiError::AlreadyExists { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn authenticate_request(
@@ -470,6 +829,7 @@ async fn list_all_config_maps(
     Ok(Json(
         state
             .backend
+            .config_maps
             .list(None, &label_selector, &field_selector)
             .await?,
     )
@@ -490,6 +850,7 @@ async fn list_config_maps(
     Ok(Json(
         state
             .backend
+            .config_maps
             .list(Some(&namespace), &label_selector, &field_selector)
             .await?,
     )
@@ -505,7 +866,7 @@ async fn create_config_map(
     let resource = bind_namespace(decode_config_map(body)?, &namespace)?;
     let admission_request = AdmissionRequest::create(identity, resource.clone())?;
     state.admission.validate(&admission_request).await?;
-    let created = state.backend.create(resource).await?;
+    let created = state.backend.config_maps.create(resource).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -513,7 +874,9 @@ async fn get_config_map(
     State(state): State<AppState>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> ApiResult<Json<ConfigMap>> {
-    Ok(Json(state.backend.get(&namespace, &name).await?))
+    Ok(Json(
+        state.backend.config_maps.get(&namespace, &name).await?,
+    ))
 }
 
 async fn replace_config_map(
@@ -523,10 +886,10 @@ async fn replace_config_map(
     body: Bytes,
 ) -> ApiResult<Json<ConfigMap>> {
     let resource = bind_update_identity(decode_config_map(body)?, &namespace, &name)?;
-    let old_object = state.backend.get(&namespace, &name).await?;
+    let old_object = state.backend.config_maps.get(&namespace, &name).await?;
     let admission_request = AdmissionRequest::update(identity, resource.clone(), old_object)?;
     state.admission.validate(&admission_request).await?;
-    Ok(Json(state.backend.update(resource).await?))
+    Ok(Json(state.backend.config_maps.update(resource).await?))
 }
 
 async fn delete_config_map(
@@ -536,12 +899,181 @@ async fn delete_config_map(
     body: Bytes,
 ) -> ApiResult<Json<ApiStatus>> {
     let options = decode_delete_options(body)?;
-    let old_object = state.backend.get(&namespace, &name).await?;
+    let old_object = state.backend.config_maps.get(&namespace, &name).await?;
     let admission_request = AdmissionRequest::delete(identity, old_object)?;
     state.admission.validate(&admission_request).await?;
-    let result = state.backend.delete(&namespace, &name, options).await?;
+    let result = state
+        .backend
+        .config_maps
+        .delete(&namespace, &name, options)
+        .await?;
     Ok(Json(ApiStatus::success(format!(
         "configmaps {name:?} deleted at resourceVersion {}",
+        result.resource_version
+    ))))
+}
+
+async fn list_all_pods(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_pod_watch(&state, &query, None).await;
+    }
+    reject_list_resource_version(&query)?;
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    Ok(Json(
+        state
+            .backend
+            .pods
+            .list(None, &label_selector, &field_selector)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn list_pods(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_pod_watch(&state, &query, Some(namespace)).await;
+    }
+    reject_list_resource_version(&query)?;
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    Ok(Json(
+        state
+            .backend
+            .pods
+            .list(Some(&namespace), &label_selector, &field_selector)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn create_pod(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path(namespace): Path<String>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Pod>)> {
+    let resource = bind_pod_namespace(decode_pod(body)?, &namespace)?;
+    let admission_request = AdmissionRequest::pod_create(identity, resource.clone())?;
+    state.admission.validate(&admission_request).await?;
+    let created = state.backend.pods.create(resource).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn get_pod(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> ApiResult<Json<Pod>> {
+    Ok(Json(state.backend.pods.get(&namespace, &name).await?))
+}
+
+async fn replace_pod(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<Pod>> {
+    let resource = bind_pod_update_identity(decode_pod(body)?, &namespace, &name)?;
+    let old_object = state.backend.pods.get(&namespace, &name).await?;
+    let admission_request = AdmissionRequest::pod_update(identity, resource.clone(), old_object)?;
+    state.admission.validate(&admission_request).await?;
+    Ok(Json(state.backend.pods.update(resource).await?))
+}
+
+async fn delete_pod(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<ApiStatus>> {
+    let options = decode_delete_options(body)?;
+    let old_object = state.backend.pods.get(&namespace, &name).await?;
+    let admission_request = AdmissionRequest::pod_delete(identity, old_object)?;
+    state.admission.validate(&admission_request).await?;
+    let result = state
+        .backend
+        .pods
+        .delete(&namespace, &name, options)
+        .await?;
+    Ok(Json(ApiStatus::success(format!(
+        "pods {name:?} deleted at resourceVersion {}",
+        result.resource_version
+    ))))
+}
+
+async fn list_namespaces(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_namespace_watch(&state, &query).await;
+    }
+    reject_list_resource_version(&query)?;
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    Ok(Json(
+        state
+            .backend
+            .namespaces
+            .list(&label_selector, &field_selector)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn create_namespace(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Namespace>)> {
+    let resource = decode_namespace(body)?;
+    let admission_request = AdmissionRequest::namespace_create(identity, resource.clone())?;
+    state.admission.validate(&admission_request).await?;
+    let created = state.backend.namespaces.create(resource).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn get_namespace(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Namespace>> {
+    Ok(Json(state.backend.namespaces.get(&name).await?))
+}
+
+async fn replace_namespace(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Namespace>> {
+    let resource = bind_namespace_update_identity(decode_namespace(body)?, &name)?;
+    let old_object = state.backend.namespaces.get(&name).await?;
+    let admission_request =
+        AdmissionRequest::namespace_update(identity, resource.clone(), old_object)?;
+    state.admission.validate(&admission_request).await?;
+    Ok(Json(state.backend.namespaces.update(resource).await?))
+}
+
+async fn delete_namespace(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<ApiStatus>> {
+    let options = decode_delete_options(body)?;
+    let old_object = state.backend.namespaces.get(&name).await?;
+    let admission_request = AdmissionRequest::namespace_delete(identity, old_object)?;
+    state.admission.validate(&admission_request).await?;
+    let result = state.backend.namespaces.delete(&name, options).await?;
+    Ok(Json(ApiStatus::success(format!(
+        "namespaces {name:?} deleted at resourceVersion {}",
         result.resource_version
     ))))
 }
@@ -567,6 +1099,7 @@ async fn open_config_map_watch(
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     let subscription = state
         .backend
+        .config_maps
         .watch(ConfigMapWatchRequest {
             namespace,
             label_selector,
@@ -579,6 +1112,49 @@ async fn open_config_map_watch(
         })
         .await?;
     Ok(watch_response(subscription))
+}
+
+async fn open_pod_watch(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: Option<String>,
+) -> ApiResult<Response> {
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    let subscription = state
+        .backend
+        .pods
+        .watch(PodWatchRequest {
+            namespace,
+            label_selector,
+            field_selector,
+            resource_version: query.resource_version.clone(),
+            allow_bookmarks: parse_boolean(
+                query.allow_watch_bookmarks.as_deref(),
+                "allowWatchBookmarks",
+            )?,
+        })
+        .await?;
+    Ok(pod_watch_response(subscription))
+}
+
+async fn open_namespace_watch(state: &AppState, query: &ListQuery) -> ApiResult<Response> {
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    let subscription = state
+        .backend
+        .namespaces
+        .watch(NamespaceWatchRequest {
+            label_selector,
+            field_selector,
+            resource_version: query.resource_version.clone(),
+            allow_bookmarks: parse_boolean(
+                query.allow_watch_bookmarks.as_deref(),
+                "allowWatchBookmarks",
+            )?,
+        })
+        .await?;
+    Ok(namespace_watch_response(subscription))
 }
 
 fn is_watch_request(query: &ListQuery) -> ApiResult<bool> {
@@ -645,6 +1221,60 @@ fn watch_response(subscription: ConfigMapWatchSubscription) -> Response {
     response
 }
 
+fn pod_watch_response(subscription: PodWatchSubscription) -> Response {
+    let event_stream = stream! {
+        let mut subscription = subscription;
+        while let Some(event) = subscription.recv().await {
+            let mut encoded = match serde_json::to_vec(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    yield Err::<Bytes, io::Error>(io::Error::other(error));
+                    break;
+                }
+            };
+            encoded.push(b'\n');
+            yield Ok::<Bytes, io::Error>(Bytes::from(encoded));
+        }
+    };
+    let mut response = Response::new(Body::from_stream(event_stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
+fn namespace_watch_response(subscription: NamespaceWatchSubscription) -> Response {
+    let event_stream = stream! {
+        let mut subscription = subscription;
+        while let Some(event) = subscription.recv().await {
+            let mut encoded = match serde_json::to_vec(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    yield Err::<Bytes, io::Error>(io::Error::other(error));
+                    break;
+                }
+            };
+            encoded.push(b'\n');
+            yield Ok::<Bytes, io::Error>(Bytes::from(encoded));
+        }
+    };
+    let mut response = Response::new(Body::from_stream(event_stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
 fn decode_config_map(body: Bytes) -> ApiResult<ConfigMap> {
     if body.is_empty() {
         return Err(ApiError::BadRequest {
@@ -655,6 +1285,29 @@ fn decode_config_map(body: Bytes) -> ApiResult<ConfigMap> {
     serde_json::from_slice(&body).map_err(|error| {
         ApiError::BadRequest {
             message: format!("invalid ConfigMap JSON: {error}"),
+        }
+        .into()
+    })
+}
+
+fn decode_pod(body: Bytes) -> ApiResult<Pod> {
+    decode_typed_resource(body, "Pod")
+}
+
+fn decode_namespace(body: Bytes) -> ApiResult<Namespace> {
+    decode_typed_resource(body, "Namespace")
+}
+
+fn decode_typed_resource<T: serde::de::DeserializeOwned>(body: Bytes, kind: &str) -> ApiResult<T> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: format!("a {kind} JSON request body is required"),
+        }
+        .into());
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        ApiError::BadRequest {
+            message: format!("invalid {kind} JSON: {error}"),
         }
         .into()
     })
@@ -686,6 +1339,51 @@ fn bind_namespace(mut resource: ConfigMap, namespace: &str) -> ApiResult<ConfigM
             resource.metadata.namespace = Some(namespace.to_owned());
             Ok(resource)
         }
+    }
+}
+
+fn bind_pod_namespace(mut resource: Pod, namespace: &str) -> ApiResult<Pod> {
+    match resource.metadata.namespace.as_deref() {
+        Some(body_namespace) if body_namespace != namespace => Err(ApiError::Invalid {
+            message: format!(
+                "metadata.namespace {body_namespace:?} does not match request namespace {namespace:?}"
+            ),
+        }
+        .into()),
+        Some(_) => Ok(resource),
+        None => {
+            resource.metadata.namespace = Some(namespace.to_owned());
+            Ok(resource)
+        }
+    }
+}
+
+fn bind_pod_update_identity(resource: Pod, namespace: &str, name: &str) -> ApiResult<Pod> {
+    let resource = bind_pod_namespace(resource, namespace)?;
+    match resource.metadata.name.as_deref() {
+        Some(body_name) if body_name == name => Ok(resource),
+        Some(body_name) => Err(ApiError::Invalid {
+            message: format!("metadata.name {body_name:?} does not match request name {name:?}"),
+        }
+        .into()),
+        None => Err(ApiError::Invalid {
+            message: "metadata.name is required for a replace request".to_owned(),
+        }
+        .into()),
+    }
+}
+
+fn bind_namespace_update_identity(resource: Namespace, name: &str) -> ApiResult<Namespace> {
+    match resource.metadata.name.as_deref() {
+        Some(body_name) if body_name == name => Ok(resource),
+        Some(body_name) => Err(ApiError::Invalid {
+            message: format!("metadata.name {body_name:?} does not match request name {name:?}"),
+        }
+        .into()),
+        None => Err(ApiError::Invalid {
+            message: "metadata.name is required for a replace request".to_owned(),
+        }
+        .into()),
     }
 }
 

@@ -51,6 +51,24 @@ impl ResourceReference {
             name: Some(name.into()),
         }
     }
+
+    pub fn pod(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            group: String::new(),
+            resource: "pods".to_owned(),
+            namespace: Some(namespace.into()),
+            name: Some(name.into()),
+        }
+    }
+
+    pub fn namespace(name: impl Into<String>) -> Self {
+        Self {
+            group: String::new(),
+            resource: "namespaces".to_owned(),
+            namespace: None,
+            name: Some(name.into()),
+        }
+    }
 }
 
 impl fmt::Display for ResourceReference {
@@ -106,7 +124,8 @@ impl ApiError {
     pub fn status_code(&self) -> u16 {
         match self {
             Self::AlreadyExists { .. } | Self::Conflict { .. } => 409,
-            Self::BadRequest { .. } | Self::Invalid { .. } => 400,
+            Self::BadRequest { .. } => 400,
+            Self::Invalid { .. } => 422,
             Self::Forbidden { .. } => 403,
             Self::ResourceExpired { .. } => 410,
             Self::NotFound { .. } => 404,

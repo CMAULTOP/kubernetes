@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
-use rusternetes_api_types::ConfigMap;
+use rusternetes_api_types::{ConfigMap, Namespace, Pod};
 use rusternetes_authn::RequestIdentity;
 use rusternetes_common::{ApiError, ResourceReference, StatusReason};
 use uuid::Uuid;
@@ -29,18 +29,36 @@ pub struct AdmissionResource {
 
 impl AdmissionResource {
     pub fn config_maps() -> Self {
+        Self::core("configmaps")
+    }
+
+    pub fn pods() -> Self {
+        Self::core("pods")
+    }
+
+    pub fn namespaces() -> Self {
+        Self::core("namespaces")
+    }
+
+    fn core(resource: &str) -> Self {
         Self {
             group: String::new(),
             version: "v1".to_owned(),
-            resource: "configmaps".to_owned(),
+            resource: resource.to_owned(),
         }
     }
 }
 
-/// Immutable ConfigMap-specific attributes passed to admission plugins.
-///
-/// This first API slice uses typed ConfigMap values instead of unstructured JSON. Additional
-/// resource variants join this boundary as their API types are implemented.
+/// Closed typed object union accepted by the current admission boundary.
+#[derive(Clone, Debug)]
+pub enum AdmissionObject {
+    ConfigMap(ConfigMap),
+    Pod(Pod),
+    Namespace(Namespace),
+}
+
+/// Immutable typed attributes passed to admission plugins. Resource-specific values remain closed
+/// Rust variants rather than generic JSON, so every persisted type must declare its contract.
 #[derive(Clone, Debug)]
 pub struct AdmissionRequest {
     pub uid: String,
@@ -48,15 +66,25 @@ pub struct AdmissionRequest {
     pub resource: AdmissionResource,
     pub namespace: String,
     pub name: String,
-    pub object: Option<ConfigMap>,
-    pub old_object: Option<ConfigMap>,
+    pub object: Option<AdmissionObject>,
+    pub old_object: Option<AdmissionObject>,
     pub dry_run: bool,
     pub user_info: RequestIdentity,
 }
 
 impl AdmissionRequest {
     pub fn create(user_info: RequestIdentity, object: ConfigMap) -> Result<Self, ApiError> {
-        Self::write(AdmissionOperation::Create, user_info, object, None)
+        let namespace = object.namespace()?.to_owned();
+        let name = object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Create,
+            user_info,
+            AdmissionResource::config_maps(),
+            namespace,
+            name,
+            Some(AdmissionObject::ConfigMap(object)),
+            None,
+        ))
     }
 
     pub fn update(
@@ -64,49 +92,148 @@ impl AdmissionRequest {
         object: ConfigMap,
         old_object: ConfigMap,
     ) -> Result<Self, ApiError> {
-        Self::write(
+        let namespace = object.namespace()?.to_owned();
+        let name = object.name()?.to_owned();
+        Ok(Self::new(
             AdmissionOperation::Update,
             user_info,
-            object,
-            Some(old_object),
-        )
+            AdmissionResource::config_maps(),
+            namespace,
+            name,
+            Some(AdmissionObject::ConfigMap(object)),
+            Some(AdmissionObject::ConfigMap(old_object)),
+        ))
     }
 
     pub fn delete(user_info: RequestIdentity, old_object: ConfigMap) -> Result<Self, ApiError> {
         let namespace = old_object.namespace()?.to_owned();
         let name = old_object.name()?.to_owned();
-        Ok(Self {
-            uid: Uuid::new_v4().to_string(),
-            operation: AdmissionOperation::Delete,
-            resource: AdmissionResource::config_maps(),
+        Ok(Self::new(
+            AdmissionOperation::Delete,
+            user_info,
+            AdmissionResource::config_maps(),
             namespace,
             name,
-            object: None,
-            old_object: Some(old_object),
-            dry_run: false,
-            user_info,
-        })
+            None,
+            Some(AdmissionObject::ConfigMap(old_object)),
+        ))
     }
 
-    fn write(
-        operation: AdmissionOperation,
+    pub fn pod_create(user_info: RequestIdentity, object: Pod) -> Result<Self, ApiError> {
+        let namespace = object.namespace()?.to_owned();
+        let name = object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Create,
+            user_info,
+            AdmissionResource::pods(),
+            namespace,
+            name,
+            Some(AdmissionObject::Pod(object)),
+            None,
+        ))
+    }
+
+    pub fn pod_update(
         user_info: RequestIdentity,
-        object: ConfigMap,
-        old_object: Option<ConfigMap>,
+        object: Pod,
+        old_object: Pod,
     ) -> Result<Self, ApiError> {
         let namespace = object.namespace()?.to_owned();
         let name = object.name()?.to_owned();
-        Ok(Self {
-            uid: Uuid::new_v4().to_string(),
-            operation,
-            resource: AdmissionResource::config_maps(),
+        Ok(Self::new(
+            AdmissionOperation::Update,
+            user_info,
+            AdmissionResource::pods(),
             namespace,
             name,
-            object: Some(object),
+            Some(AdmissionObject::Pod(object)),
+            Some(AdmissionObject::Pod(old_object)),
+        ))
+    }
+
+    pub fn pod_delete(user_info: RequestIdentity, old_object: Pod) -> Result<Self, ApiError> {
+        let namespace = old_object.namespace()?.to_owned();
+        let name = old_object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Delete,
+            user_info,
+            AdmissionResource::pods(),
+            namespace,
+            name,
+            None,
+            Some(AdmissionObject::Pod(old_object)),
+        ))
+    }
+
+    pub fn namespace_create(
+        user_info: RequestIdentity,
+        object: Namespace,
+    ) -> Result<Self, ApiError> {
+        let name = object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Create,
+            user_info,
+            AdmissionResource::namespaces(),
+            String::new(),
+            name,
+            Some(AdmissionObject::Namespace(object)),
+            None,
+        ))
+    }
+
+    pub fn namespace_update(
+        user_info: RequestIdentity,
+        object: Namespace,
+        old_object: Namespace,
+    ) -> Result<Self, ApiError> {
+        let name = object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Update,
+            user_info,
+            AdmissionResource::namespaces(),
+            String::new(),
+            name,
+            Some(AdmissionObject::Namespace(object)),
+            Some(AdmissionObject::Namespace(old_object)),
+        ))
+    }
+
+    pub fn namespace_delete(
+        user_info: RequestIdentity,
+        old_object: Namespace,
+    ) -> Result<Self, ApiError> {
+        let name = old_object.name()?.to_owned();
+        Ok(Self::new(
+            AdmissionOperation::Delete,
+            user_info,
+            AdmissionResource::namespaces(),
+            String::new(),
+            name,
+            None,
+            Some(AdmissionObject::Namespace(old_object)),
+        ))
+    }
+
+    fn new(
+        operation: AdmissionOperation,
+        user_info: RequestIdentity,
+        resource: AdmissionResource,
+        namespace: String,
+        name: String,
+        object: Option<AdmissionObject>,
+        old_object: Option<AdmissionObject>,
+    ) -> Self {
+        Self {
+            uid: Uuid::new_v4().to_string(),
+            operation,
+            resource,
+            namespace,
+            name,
+            object,
             old_object,
             dry_run: false,
             user_info,
-        })
+        }
     }
 }
 
@@ -272,7 +399,9 @@ impl AdmissionPlugin for NamespaceLifecyclePlugin {
         request: &'a AdmissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
         Box::pin(async move {
-            if request.operation != AdmissionOperation::Create {
+            if request.operation != AdmissionOperation::Create
+                || request.resource == AdmissionResource::namespaces()
+            {
                 return Ok(());
             }
             match self.namespaces.phase(&request.namespace).await? {

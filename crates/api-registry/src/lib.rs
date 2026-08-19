@@ -128,13 +128,29 @@ impl ApiRegistry {
         Self::try_new(vec![GroupVersionStrategy {
             group: "",
             version: "v1",
-            resources: vec![ResourceStrategy {
-                plural: "configmaps",
-                singular: "configmap",
-                kind: "ConfigMap",
-                scope: ResourceScope::Namespaced,
-                verbs: &["create", "delete", "get", "list", "update", "watch"],
-            }],
+            resources: vec![
+                ResourceStrategy {
+                    plural: "configmaps",
+                    singular: "configmap",
+                    kind: "ConfigMap",
+                    scope: ResourceScope::Namespaced,
+                    verbs: &["create", "delete", "get", "list", "update", "watch"],
+                },
+                ResourceStrategy {
+                    plural: "pods",
+                    singular: "pod",
+                    kind: "Pod",
+                    scope: ResourceScope::Namespaced,
+                    verbs: &["create", "delete", "get", "list", "update", "watch"],
+                },
+                ResourceStrategy {
+                    plural: "namespaces",
+                    singular: "namespace",
+                    kind: "Namespace",
+                    scope: ResourceScope::Cluster,
+                    verbs: &["create", "delete", "get", "list", "update", "watch"],
+                },
+            ],
         }])
         .expect("the built-in Rusternetes core/v1 registry is valid")
     }
@@ -175,31 +191,56 @@ impl ApiRegistry {
         })
     }
 
-    /// Resolves the subset of Kubernetes core/v1 paths currently backed by a Rust strategy.
+    /// Resolves executable core/v1 cluster- and namespace-scoped resource paths.
     pub fn resolve_core_v1_path(&self, path: &str) -> Option<ResolvedResourcePath> {
         let segments = path
             .trim_start_matches('/')
             .split('/')
             .filter(|segment| !segment.is_empty())
             .collect::<Vec<_>>();
-        let (plural, namespace, name) = match segments.as_slice() {
-            ["api", "v1", plural] => (*plural, None, None),
-            ["api", "v1", "namespaces", namespace, plural] => {
-                (*plural, Some((*namespace).to_owned()), None)
+        let group_version = self.group_version("", "v1")?;
+        let resolve = |plural: &str| {
+            group_version
+                .resources
+                .iter()
+                .find(|resource| resource.plural == plural)
+                .cloned()
+        };
+        let (resource, namespace, name) = match segments.as_slice() {
+            ["api", "v1", plural] => (resolve(plural)?, None, None),
+            ["api", "v1", plural, name] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    None,
+                    matches!(resource.scope, ResourceScope::Cluster).then(|| (*name).to_owned()),
+                )
             }
-            ["api", "v1", "namespaces", namespace, plural, name] => (
-                *plural,
-                Some((*namespace).to_owned()),
-                Some((*name).to_owned()),
-            ),
+            ["api", "v1", "namespaces", namespace, plural] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    None,
+                )
+            }
+            ["api", "v1", "namespaces", namespace, plural, name] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    matches!(resource.scope, ResourceScope::Namespaced).then(|| (*name).to_owned()),
+                )
+            }
             _ => return None,
         };
-        let group_version = self.group_version("", "v1")?;
-        let resource = group_version
-            .resources
-            .iter()
-            .find(|resource| resource.plural == plural)?
-            .clone();
+        match resource.scope {
+            ResourceScope::Cluster if namespace.is_some() => return None,
+            ResourceScope::Namespaced if segments.len() == 4 => return None,
+            _ => {}
+        }
         Some(ResolvedResourcePath {
             group: group_version.group,
             version: group_version.version,
@@ -225,9 +266,19 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 1);
-        assert_eq!(discovery.resources[0].name, "configmaps");
-        assert!(discovery.resources[0].verbs.contains(&"watch"));
+        assert_eq!(discovery.resources.len(), 3);
+        assert!(discovery
+            .resources
+            .iter()
+            .any(|resource| resource.name == "configmaps" && resource.namespaced));
+        assert!(discovery
+            .resources
+            .iter()
+            .any(|resource| resource.name == "pods" && resource.namespaced));
+        assert!(discovery
+            .resources
+            .iter()
+            .any(|resource| resource.name == "namespaces" && !resource.namespaced));
 
         let route = registry
             .resolve_core_v1_path("/api/v1/namespaces/development/configmaps/settings")
@@ -235,6 +286,19 @@ mod tests {
         assert_eq!(route.resource.kind, "ConfigMap");
         assert_eq!(route.namespace.as_deref(), Some("development"));
         assert_eq!(route.name.as_deref(), Some("settings"));
+
+        let namespace = registry
+            .resolve_core_v1_path("/api/v1/namespaces/development")
+            .expect("cluster-scoped Namespace path resolves");
+        assert_eq!(namespace.resource.kind, "Namespace");
+        assert_eq!(namespace.namespace, None);
+        assert_eq!(namespace.name.as_deref(), Some("development"));
+
+        let pod_collection = registry
+            .resolve_core_v1_path("/api/v1/namespaces/development/pods")
+            .expect("namespaced Pod collection resolves");
+        assert_eq!(pod_collection.resource.kind, "Pod");
+        assert_eq!(pod_collection.namespace.as_deref(), Some("development"));
     }
 
     #[test]
