@@ -762,7 +762,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name",
-            get(get_pod).put(replace_pod).delete(delete_pod),
+            get(get_pod)
+                .put(replace_pod)
+                .patch(patch_pod)
+                .delete(delete_pod),
         )
         .route(
             "/api/v1/namespaces/:namespace/pods/:name/status",
@@ -1627,6 +1630,24 @@ async fn replace_pod(
     Ok(Json(state.backend.pods.update(resource).await?))
 }
 
+async fn patch_pod(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Pod>> {
+    let current = state.backend.pods.get(&namespace, &name).await?;
+    let patched = bind_pod_update_identity(
+        apply_pod_patch(current.clone(), &headers, body)?,
+        &namespace,
+        &name,
+    )?;
+    let admission_request = AdmissionRequest::pod_update(identity, patched.clone(), current)?;
+    state.admission.validate(&admission_request).await?;
+    Ok(Json(state.backend.pods.update(patched).await?))
+}
+
 async fn get_pod_status(
     State(state): State<AppState>,
     Path((namespace, name)): Path<(String, String)>,
@@ -2173,6 +2194,46 @@ fn decode_node(body: Bytes) -> ApiResult<Node> {
 enum NodePatchFormat {
     JsonPatch,
     MergePatch,
+}
+
+fn apply_pod_patch(current: Pod, headers: &HeaderMap, body: Bytes) -> ApiResult<Pod> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a Pod PATCH request body is required".to_owned(),
+        }
+        .into());
+    }
+    let mut document = serde_json::to_value(current).map_err(|_| ApiError::Internal)?;
+    match node_patch_format(headers)? {
+        NodePatchFormat::JsonPatch => {
+            let patch: json_patch::Patch =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Patch document: {error}"),
+                })?;
+            json_patch::patch(&mut document, &patch).map_err(|error| ApiError::Invalid {
+                message: format!("JSON Patch could not be applied: {error}"),
+            })?;
+        }
+        NodePatchFormat::MergePatch => {
+            let patch: Value =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Merge Patch document: {error}"),
+                })?;
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest {
+                    message: "JSON Merge Patch document must be an object".to_owned(),
+                }
+                .into());
+            }
+            json_patch::merge(&mut document, &patch);
+        }
+    }
+    serde_json::from_value(document).map_err(|error| {
+        ApiError::Invalid {
+            message: format!("PATCH result is not a valid Pod: {error}"),
+        }
+        .into()
+    })
 }
 
 fn apply_config_map_patch(
@@ -2958,6 +3019,129 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&stale).expect("stale Pod serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn pod_patch_preserves_spec_and_status_invariants() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": { "name": "patch-pod" },
+                            "spec": { "containers": [{ "name": "app", "image": "v1" }] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created: Pod = serde_json::from_slice(
+            &to_bytes(create.into_body(), usize::MAX)
+                .await
+                .expect("create body is readable"),
+        )
+        .expect("created Pod is JSON");
+
+        let label_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/pods/patch-pod")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"metadata":{"labels":{"patched":"true"}}}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(label_response.status(), StatusCode::OK);
+        let labeled: Pod = serde_json::from_slice(
+            &to_bytes(label_response.into_body(), usize::MAX)
+                .await
+                .expect("label response is readable"),
+        )
+        .expect("labeled Pod is JSON");
+        assert_eq!(
+            labeled.metadata.labels.get("patched"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(labeled.spec, created.spec);
+        assert_eq!(labeled.status, created.status);
+
+        let json_patch_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/pods/patch-pod")
+                    .header(header::CONTENT_TYPE, "application/json-patch+json")
+                    .body(Body::from(
+                        r#"[{"op":"add","path":"/metadata/labels/json-patched","value":"true"}]"#,
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(json_patch_response.status(), StatusCode::OK);
+        let json_patched: Pod = serde_json::from_slice(
+            &to_bytes(json_patch_response.into_body(), usize::MAX)
+                .await
+                .expect("JSON Patch body is readable"),
+        )
+        .expect("JSON patched Pod is JSON");
+        assert_eq!(
+            json_patched.metadata.labels.get("json-patched"),
+            Some(&"true".to_owned())
+        );
+
+        for body in [
+            r#"{"spec":{"containers":[{"name":"app","image":"v2"}]}}"#,
+            r#"{"status":{"phase":"Running"}}"#,
+            r#"{"metadata":{"name":"different"}}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/v1/namespaces/default/pods/patch-pod")
+                        .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                        .body(Body::from(body))
+                        .expect("valid request"),
+                )
+                .await
+                .expect("router is infallible");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let stale_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/pods/patch-pod")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "metadata": { "resourceVersion": created.metadata.resource_version,
+                                          "labels": { "stale": "true" } }
+                        })
+                        .to_string(),
                     ))
                     .expect("valid request"),
             )
