@@ -6,17 +6,24 @@
 
 use std::sync::Arc;
 
-use etcd_client::{Compare, CompareOp, GetOptions, Txn, TxnOp};
+use etcd_client::{
+    Compare, CompareOp, EventType as EtcdEventType, GetOptions, Txn, TxnOp, WatchOptions,
+};
 use rusternetes_api_types::{
-    ConfigMap, ConfigMapList, DeleteOptions, FieldSelector, LabelSelector,
+    ConfigMap, ConfigMapList, ConfigMapWatchEvent, ConfigMapWatchObject, DeleteOptions,
+    FieldSelector, LabelSelector,
 };
 use rusternetes_common::{ApiError, ResourceReference};
-use rusternetes_storage::DeleteResult;
+use rusternetes_storage::{ConfigMapWatchRequest, DeleteResult};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 const DEFAULT_PREFIX: &str = "/registry/configmaps";
+const WATCH_CHANNEL_CAPACITY: usize = 256;
 
 /// Durable repository mapping one ConfigMap to one etcd key.
 ///
@@ -30,6 +37,27 @@ pub struct EtcdConfigMapRepository {
 struct StoredConfigMap {
     resource: ConfigMap,
     mod_revision: i64,
+}
+
+/// A bounded, cancellation-safe durable ConfigMap WATCH subscription backed by etcd.
+///
+/// Dropping the subscription aborts its bridge task, releases the gRPC watch stream and closes the
+/// bounded channel. No caller can cause unbounded per-watch buffering in the API Server.
+pub struct EtcdConfigMapWatchSubscription {
+    receiver: mpsc::Receiver<rusternetes_api_types::ConfigMapWatchEvent>,
+    bridge_task: JoinHandle<()>,
+}
+
+impl EtcdConfigMapWatchSubscription {
+    pub async fn recv(&mut self) -> Option<rusternetes_api_types::ConfigMapWatchEvent> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for EtcdConfigMapWatchSubscription {
+    fn drop(&mut self) {
+        self.bridge_task.abort();
+    }
 }
 
 impl EtcdConfigMapRepository {
@@ -115,6 +143,91 @@ impl EtcdConfigMapRepository {
             field_selector,
         )
         .await
+    }
+
+    /// Opens a bounded ConfigMap watch that replays etcd history and continues with live events.
+    ///
+    /// A requested historical revision is checked before the HTTP layer starts its response. If
+    /// etcd has compacted it, callers receive typed Kubernetes `410 Expired` instead of a stream
+    /// that would falsely imply continuity.
+    pub async fn watch(
+        &self,
+        request: ConfigMapWatchRequest,
+    ) -> Result<EtcdConfigMapWatchSubscription, ApiError> {
+        let requested_revision = parse_watch_resource_version(request.resource_version.as_deref())?;
+        let prefix = match request.namespace.as_deref() {
+            Some(namespace) => format!("{}/", self.namespace_prefix(namespace)?),
+            None => format!("{}/", self.key_prefix),
+        };
+
+        if let Some(revision) = requested_revision {
+            // etcd treats revision 0 as a current read, while Kubernetes resourceVersion=0 asks
+            // for every retained change. Probe revision 1 so compaction is surfaced before the
+            // watch stream's creation response, which cannot be translated after HTTP starts.
+            self.ensure_history_available(&prefix, revision.max(1))
+                .await?;
+        }
+
+        let mut watch_client = self.client.lock().await.watch_client();
+        let options = match requested_revision {
+            Some(revision) => WatchOptions::new()
+                .with_prefix()
+                .with_prev_key()
+                .with_start_revision(revision.checked_add(1).ok_or(ApiError::BadRequest {
+                    message: "resourceVersion is too large for the etcd watch backend".to_owned(),
+                })?),
+            None => WatchOptions::new().with_prefix().with_prev_key(),
+        };
+        let (_watcher, mut stream) = watch_client
+            .watch(prefix, Some(options))
+            .await
+            .map_err(map_etcd_watch_error)?;
+        let (sender, receiver) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
+        let bridge_task = tokio::spawn(async move {
+            loop {
+                let response = match stream.message().await {
+                    Ok(Some(response)) => response,
+                    Ok(None) | Err(_) => return,
+                };
+                if response.canceled() {
+                    return;
+                }
+                for event in response.events() {
+                    let translated = match translate_watch_event(event) {
+                        Ok(Some(event)) => event,
+                        Ok(None) | Err(_) => continue,
+                    };
+                    let ConfigMapWatchObject::ConfigMap(resource) = &translated.object else {
+                        continue;
+                    };
+                    if !watch_matches(&request, resource) {
+                        continue;
+                    }
+                    match sender.try_send(translated) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_))
+                        | Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    }
+                }
+            }
+        });
+        Ok(EtcdConfigMapWatchSubscription {
+            receiver,
+            bridge_task,
+        })
+    }
+
+    async fn ensure_history_available(&self, prefix: &str, revision: i64) -> Result<(), ApiError> {
+        self.client
+            .lock()
+            .await
+            .get(
+                prefix,
+                Some(GetOptions::new().with_prefix().with_revision(revision)),
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_etcd_watch_error)
     }
 
     /// Replaces a ConfigMap through an atomic mod-revision comparison.
@@ -260,6 +373,64 @@ impl EtcdConfigMapRepository {
     fn namespace_prefix(&self, namespace: &str) -> Result<String, ApiError> {
         validate_key_component("namespace", namespace)?;
         Ok(format!("{}/{}", self.key_prefix, namespace))
+    }
+}
+
+fn parse_watch_resource_version(raw: Option<&str>) -> Result<Option<i64>, ApiError> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    raw.parse::<i64>()
+        .ok()
+        .filter(|revision| *revision >= 0)
+        .ok_or_else(|| ApiError::BadRequest {
+            message: format!("resourceVersion {raw:?} is not a valid etcd revision"),
+        })
+        .map(Some)
+}
+
+fn map_etcd_watch_error(error: etcd_client::Error) -> ApiError {
+    match error {
+        etcd_client::Error::GRpcStatus(status)
+            if status
+                .message()
+                .contains("required revision has been compacted") =>
+        {
+            ApiError::ResourceExpired {
+                message: format!("requested etcd revision is compacted: {}", status.message()),
+            }
+        }
+        _ => ApiError::Internal,
+    }
+}
+
+fn watch_matches(request: &ConfigMapWatchRequest, resource: &ConfigMap) -> bool {
+    request
+        .namespace
+        .as_deref()
+        .is_none_or(|namespace| resource.metadata.namespace.as_deref() == Some(namespace))
+        && request.label_selector.matches(&resource.metadata.labels)
+        && request.field_selector.matches(resource)
+}
+
+fn translate_watch_event(
+    event: &etcd_client::Event,
+) -> Result<Option<ConfigMapWatchEvent>, ApiError> {
+    let key_value = event.kv().ok_or(ApiError::Internal)?;
+    match event.event_type() {
+        EtcdEventType::Put => {
+            let resource = decode(key_value.value(), key_value.mod_revision())?;
+            if key_value.version() == 1 {
+                Ok(Some(ConfigMapWatchEvent::added(resource)))
+            } else {
+                Ok(Some(ConfigMapWatchEvent::modified(resource)))
+            }
+        }
+        EtcdEventType::Delete => {
+            let previous = event.prev_kv().ok_or(ApiError::Internal)?;
+            let resource = decode(previous.value(), key_value.mod_revision())?;
+            Ok(Some(ConfigMapWatchEvent::deleted(resource)))
+        }
     }
 }
 

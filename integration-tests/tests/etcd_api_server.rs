@@ -221,7 +221,7 @@ async fn http_crud_uses_real_etcd_storage_without_falling_back_to_memory() {
         created.metadata.resource_version
     );
 
-    let mut stale = created;
+    let mut stale = created.clone();
     stale.data.insert("mode".to_owned(), "stale".to_owned());
     let stale_response = client
         .put(&resource_url)
@@ -231,18 +231,42 @@ async fn http_crud_uses_real_etcd_storage_without_falling_back_to_memory() {
         .unwrap_or_else(|error| panic!("stale update completes: {error}"));
     assert_eq!(stale_response.status(), reqwest::StatusCode::CONFLICT);
 
-    let watch_response = client
+    let mut watch_response = client
         .get(&collection)
-        .query(&[("watch", "true")])
+        .query(&[
+            ("watch", "true"),
+            (
+                "resourceVersion",
+                created
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .expect("created resource has a version"),
+            ),
+            ("labelSelector", "tier=api"),
+            ("fieldSelector", "metadata.name=settings"),
+        ])
         .send()
         .await
-        .unwrap_or_else(|error| panic!("watch request completes: {error}"));
-    assert_eq!(watch_response.status(), reqwest::StatusCode::BAD_REQUEST);
-    let watch_status: ApiStatus = watch_response
-        .json()
+        .unwrap_or_else(|error| panic!("durable watch request completes: {error}"));
+    assert_eq!(watch_response.status(), reqwest::StatusCode::OK);
+
+    let replayed_chunk = watch_response
+        .chunk()
         .await
-        .unwrap_or_else(|error| panic!("watch rejection is Kubernetes Status: {error}"));
-    assert_eq!(watch_status.reason, StatusReason::BadRequest);
+        .unwrap_or_else(|error| panic!("historical watch event arrives: {error}"))
+        .expect("historical watch body contains an event");
+    let replayed: serde_json::Value = serde_json::from_slice(&replayed_chunk)
+        .unwrap_or_else(|error| panic!("historical watch event is JSON: {error}"));
+    assert_eq!(replayed["type"], "MODIFIED");
+    assert_eq!(
+        replayed["object"]["metadata"]["resourceVersion"],
+        updated
+            .metadata
+            .resource_version
+            .as_deref()
+            .expect("updated resource has a version")
+    );
 
     let deleted_response = client
         .delete(&resource_url)
@@ -250,5 +274,67 @@ async fn http_crud_uses_real_etcd_storage_without_falling_back_to_memory() {
         .await
         .unwrap_or_else(|error| panic!("delete completes: {error}"));
     assert_eq!(deleted_response.status(), reqwest::StatusCode::OK);
+    let live_chunk = watch_response
+        .chunk()
+        .await
+        .unwrap_or_else(|error| panic!("live watch event arrives: {error}"))
+        .expect("live watch body contains a delete event");
+    let live: serde_json::Value = serde_json::from_slice(&live_chunk)
+        .unwrap_or_else(|error| panic!("live watch event is JSON: {error}"));
+    assert_eq!(live["type"], "DELETED");
+    assert_eq!(live["object"]["metadata"]["name"], "settings");
     assert!(repository.get("default", "settings").await.is_err());
+}
+
+#[tokio::test]
+async fn http_watch_reports_410_when_etcd_history_is_compacted() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-watch-compaction/{}", Uuid::new_v4());
+    let repository = Arc::new(
+        EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+            .await
+            .expect("etcd repository connects"),
+    );
+    let server = start_server(repository.clone()).await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/namespaces/default/configmaps", server.base_url);
+    let created_response = client
+        .post(&collection)
+        .json(&config_map("settings", "default", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("HTTP create completes: {error}"));
+    let created: ConfigMap = created_response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("create response is ConfigMap: {error}"));
+    let revision = created
+        .metadata
+        .resource_version
+        .as_deref()
+        .expect("create response has etcd revision")
+        .parse::<i64>()
+        .expect("revision is numeric");
+
+    let mut raw_client = etcd_client::Client::connect([endpoint.as_str()], None)
+        .await
+        .expect("raw maintenance client connects");
+    raw_client
+        .compact(revision, None)
+        .await
+        .expect("etcd compacts old history");
+
+    let response = client
+        .get(&collection)
+        .query(&[("watch", "true"), ("resourceVersion", "0")])
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("compacted watch request completes: {error}"));
+    assert_eq!(response.status(), reqwest::StatusCode::GONE);
+    let status: ApiStatus = response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("410 response uses Kubernetes Status JSON: {error}"));
+    assert_eq!(status.reason, StatusReason::Expired);
+    assert_eq!(status.code, 410);
 }

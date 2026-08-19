@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+etcd-client.workspace = true
 futures-util.workspace = true
 idna_adapter.workspace = true
 reqwest.workspace = true

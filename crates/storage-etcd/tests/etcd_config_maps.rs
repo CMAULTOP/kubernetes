@@ -12,6 +12,7 @@ use rusternetes_api_types::{
     ConfigMap, DeleteOptions, FieldSelector, LabelSelector, ObjectMeta, TypeMeta,
 };
 use rusternetes_common::ApiError;
+use rusternetes_storage::ConfigMapWatchRequest;
 use rusternetes_storage_etcd::EtcdConfigMapRepository;
 use uuid::Uuid;
 
@@ -194,5 +195,43 @@ async fn persists_config_maps_with_etcd_revisions_and_transactional_conflicts() 
     assert!(matches!(
         repository.get("default", "settings").await,
         Err(ApiError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn compacted_etcd_history_is_reported_as_kubernetes_resource_expired() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-watch-compaction-tests/{}", Uuid::new_v4());
+    let repository = EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+        .await
+        .expect("repository connects through real etcd gRPC API");
+    let created = repository
+        .create(config_map("settings"))
+        .await
+        .expect("create persists one revision");
+    let revision = created
+        .metadata
+        .resource_version
+        .as_deref()
+        .expect("created object has etcd revision")
+        .parse::<i64>()
+        .expect("resource version is numeric");
+
+    let mut raw_client = etcd_client::Client::connect([endpoint.as_str()], None)
+        .await
+        .expect("raw maintenance client connects");
+    raw_client
+        .compact(revision, None)
+        .await
+        .expect("etcd compacts historical revisions");
+
+    assert!(matches!(
+        repository
+            .watch(ConfigMapWatchRequest {
+                resource_version: Some("0".to_owned()),
+                ..ConfigMapWatchRequest::default()
+            })
+            .await,
+        Err(ApiError::ResourceExpired { .. })
     ));
 }

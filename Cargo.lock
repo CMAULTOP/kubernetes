@@ -920,6 +920,7 @@ name = "rusternetes-integration-tests"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "etcd-client",
  "futures-util",
  "idna_adapter",
  "reqwest",

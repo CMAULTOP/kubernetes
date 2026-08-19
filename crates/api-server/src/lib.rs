@@ -17,9 +17,10 @@ use rusternetes_api_types::{
 };
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
-    ConfigMapWatchRequest, ConfigMapWatchSubscription, DeleteResult, InMemoryConfigMapStore,
+    ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
+    DeleteResult, InMemoryConfigMapStore,
 };
-use rusternetes_storage_etcd::EtcdConfigMapRepository;
+use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdConfigMapWatchSubscription};
 use serde::{Deserialize, Serialize};
 
 /// The ConfigMap persistence implementation selected when building an API Server router.
@@ -30,6 +31,22 @@ use serde::{Deserialize, Serialize};
 pub enum ConfigMapBackend {
     InMemory(Arc<InMemoryConfigMapStore>),
     Etcd(Arc<EtcdConfigMapRepository>),
+}
+
+/// A uniform stream receiver for the HTTP layer. Backends retain ownership of their transport and
+/// cancellation semantics; the API Server only serializes the typed Kubernetes event envelope.
+pub enum ConfigMapWatchSubscription {
+    InMemory(InMemoryConfigMapWatchSubscription),
+    Etcd(EtcdConfigMapWatchSubscription),
+}
+
+impl ConfigMapWatchSubscription {
+    async fn recv(&mut self) -> Option<rusternetes_api_types::ConfigMapWatchEvent> {
+        match self {
+            Self::InMemory(subscription) => subscription.recv().await,
+            Self::Etcd(subscription) => subscription.recv().await,
+        }
+    }
 }
 
 impl ConfigMapBackend {
@@ -92,10 +109,14 @@ impl ConfigMapBackend {
         request: ConfigMapWatchRequest,
     ) -> Result<ConfigMapWatchSubscription, ApiError> {
         match self {
-            Self::InMemory(store) => store.watch(request).await,
-            Self::Etcd(_) => Err(ApiError::BadRequest {
-                message: "watch=true is not yet implemented for the etcd backend; durable WATCH requires a separate end-to-end integration".to_owned(),
-            }),
+            Self::InMemory(store) => store
+                .watch(request)
+                .await
+                .map(ConfigMapWatchSubscription::InMemory),
+            Self::Etcd(repository) => repository
+                .watch(request)
+                .await
+                .map(ConfigMapWatchSubscription::Etcd),
         }
     }
 }
