@@ -753,6 +753,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             "/api/v1/namespaces/:namespace/configmaps/:name",
             get(get_config_map)
                 .put(replace_config_map)
+                .patch(patch_config_map)
                 .delete(delete_config_map),
         )
         .route(
@@ -1302,6 +1303,24 @@ async fn replace_config_map(
     let admission_request = AdmissionRequest::update(identity, resource.clone(), old_object)?;
     state.admission.validate(&admission_request).await?;
     Ok(Json(state.backend.config_maps.update(resource).await?))
+}
+
+async fn patch_config_map(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path((namespace, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<ConfigMap>> {
+    let current = state.backend.config_maps.get(&namespace, &name).await?;
+    let patched = bind_update_identity(
+        apply_config_map_patch(current.clone(), &headers, body)?,
+        &namespace,
+        &name,
+    )?;
+    let admission_request = AdmissionRequest::update(identity, patched.clone(), current)?;
+    state.admission.validate(&admission_request).await?;
+    Ok(Json(state.backend.config_maps.update(patched).await?))
 }
 
 async fn delete_config_map(
@@ -2156,6 +2175,50 @@ enum NodePatchFormat {
     MergePatch,
 }
 
+fn apply_config_map_patch(
+    current: ConfigMap,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> ApiResult<ConfigMap> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a ConfigMap PATCH request body is required".to_owned(),
+        }
+        .into());
+    }
+    let mut document = serde_json::to_value(current).map_err(|_| ApiError::Internal)?;
+    match node_patch_format(headers)? {
+        NodePatchFormat::JsonPatch => {
+            let patch: json_patch::Patch =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Patch document: {error}"),
+                })?;
+            json_patch::patch(&mut document, &patch).map_err(|error| ApiError::Invalid {
+                message: format!("JSON Patch could not be applied: {error}"),
+            })?;
+        }
+        NodePatchFormat::MergePatch => {
+            let patch: Value =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Merge Patch document: {error}"),
+                })?;
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest {
+                    message: "JSON Merge Patch document must be an object".to_owned(),
+                }
+                .into());
+            }
+            json_patch::merge(&mut document, &patch);
+        }
+    }
+    serde_json::from_value(document).map_err(|error| {
+        ApiError::Invalid {
+            message: format!("PATCH result is not a valid ConfigMap: {error}"),
+        }
+        .into()
+    })
+}
+
 fn apply_node_patch(current: Node, headers: &HeaderMap, body: Bytes) -> ApiResult<Node> {
     if body.is_empty() {
         return Err(ApiError::BadRequest {
@@ -2682,6 +2745,133 @@ mod tests {
             .await
             .expect("router is infallible");
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn config_map_patch_supports_json_and_merge_patch_with_guards() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/configmaps")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "ConfigMap",
+                            "metadata": { "name": "patch-settings" },
+                            "data": { "mode": "safe" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created: ConfigMap = serde_json::from_slice(
+            &to_bytes(create.into_body(), usize::MAX)
+                .await
+                .expect("create body is readable"),
+        )
+        .expect("created ConfigMap is JSON");
+
+        let merged_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/configmaps/patch-settings")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"data":{"mode":"merge","extra":"value"}}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(merged_response.status(), StatusCode::OK);
+        let merged: ConfigMap = serde_json::from_slice(
+            &to_bytes(merged_response.into_body(), usize::MAX)
+                .await
+                .expect("merge body is readable"),
+        )
+        .expect("merge ConfigMap is JSON");
+        assert_eq!(merged.data.get("mode"), Some(&"merge".to_owned()));
+        assert_eq!(merged.data.get("extra"), Some(&"value".to_owned()));
+
+        let json_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/configmaps/patch-settings")
+                    .header(header::CONTENT_TYPE, "application/json-patch+json")
+                    .body(Body::from(
+                        r#"[{"op":"replace","path":"/data/mode","value":"json"}]"#,
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(json_response.status(), StatusCode::OK);
+        let json_patched: ConfigMap = serde_json::from_slice(
+            &to_bytes(json_response.into_body(), usize::MAX)
+                .await
+                .expect("JSON Patch body is readable"),
+        )
+        .expect("JSON Patch ConfigMap is JSON");
+        assert_eq!(json_patched.data.get("mode"), Some(&"json".to_owned()));
+
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/configmaps/patch-settings")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"metadata":{"name":"different"}}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(identity_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let unsupported_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/configmaps/patch-settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(
+            unsupported_response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let stale_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/configmaps/patch-settings")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "metadata": { "resourceVersion": created.metadata.resource_version },
+                            "data": { "mode": "stale" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
