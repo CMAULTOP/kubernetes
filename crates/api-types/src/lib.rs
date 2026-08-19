@@ -431,6 +431,30 @@ impl Pod {
         Ok(())
     }
 
+    /// Validates and applies one scheduler-owned assignment without exposing general Pod spec mutation.
+    pub fn bind_to_node(&mut self, previous: &Self, node_name: &str) -> Result<(), ApiError> {
+        validate_dns_subdomain("binding.target.name", node_name, 253)?;
+        if previous.spec.node_name.is_some() {
+            return Err(ApiError::Conflict {
+                resource: rusternetes_common::ResourceReference::pod(
+                    previous.namespace()?.to_owned(),
+                    previous.name()?.to_owned(),
+                ),
+            });
+        }
+        if self.spec != previous.spec
+            || self.status != previous.status
+            || self.metadata != previous.metadata
+        {
+            return Err(ApiError::Invalid {
+                message: "scheduler binding must start from the current immutable Pod snapshot"
+                    .to_owned(),
+            });
+        }
+        self.spec.node_name = Some(node_name.to_owned());
+        Ok(())
+    }
+
     pub fn set_create_metadata(
         &mut self,
         uid: String,

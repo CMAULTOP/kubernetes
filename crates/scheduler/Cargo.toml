@@ -1,0 +1,16 @@
+[package]
+name = "rusternetes-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusternetes-api-types = { path = "../api-types" }
+rusternetes-common = { path = "../common" }
+rusternetes-controller-runtime = { path = "../controller-runtime" }
+rusternetes-storage = { path = "../storage" }
+rusternetes-storage-etcd = { path = "../storage-etcd" }
+thiserror.workspace = true
+tokio.workspace = true

@@ -10,6 +10,7 @@ members = [
     "crates/storage",
     "crates/storage-etcd",
     "crates/controller-runtime",
+    "crates/scheduler",
     "crates/api-server",
     "integration-tests",
 ]

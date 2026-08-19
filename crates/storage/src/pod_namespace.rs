@@ -261,6 +261,48 @@ impl InMemoryPodStore {
         Ok(resource)
     }
 
+    /// Atomically assigns an unscheduled Pod to a node after checking the scheduler snapshot's
+    /// resourceVersion. Competing schedulers receive Conflict and no assignment is overwritten.
+    pub async fn bind(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource_version: &str,
+        node_name: &str,
+    ) -> Result<Pod, ApiError> {
+        self.drain_closed_watchers().await;
+        let key = PodKey {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        };
+        let mut state = self.state.write().await;
+        let previous = state
+            .pods
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: key.reference(),
+            })?;
+        verify_update_version(
+            Some(resource_version),
+            previous.metadata.resource_version.as_deref(),
+            &key.reference(),
+        )?;
+        let mut bound = previous.clone();
+        bound.bind_to_node(&previous, node_name)?;
+        let next_resource_version = state.next_resource_version();
+        bound.preserve_server_metadata_from(&previous, next_resource_version);
+        let event = PodWatchEvent::modified(bound.clone());
+        state.pods.insert(key, bound.clone());
+        let revision = state.revision;
+        state.publish(PodHistoryEvent {
+            revision,
+            resource: bound.clone(),
+            event,
+        });
+        Ok(bound)
+    }
+
     pub async fn delete(
         &self,
         namespace: &str,

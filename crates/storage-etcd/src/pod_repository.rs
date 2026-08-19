@@ -282,6 +282,49 @@ impl EtcdPodRepository {
         Ok(resource)
     }
 
+    /// Atomically applies the scheduler's one-time node assignment to an unscheduled Pod.
+    pub async fn bind(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource_version: &str,
+        node_name: &str,
+    ) -> Result<Pod, ApiError> {
+        let reference = ResourceReference::pod(namespace.to_owned(), name.to_owned());
+        let stored = self.get_stored(namespace, name).await?;
+        if stored.resource.metadata.resource_version.as_deref() != Some(resource_version) {
+            return Err(ApiError::Conflict {
+                resource: reference,
+            });
+        }
+        let mut bound = stored.resource.clone();
+        bound.bind_to_node(&stored.resource, node_name)?;
+        bound.preserve_server_metadata_from(&stored.resource, "0".to_owned());
+        let encoded = encode(&bound)?;
+        let key = self.pod_key(namespace, name)?;
+        let transaction = Txn::new()
+            .when(vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                stored.mod_revision,
+            )])
+            .and_then(vec![TxnOp::put(key, encoded, None)]);
+        let response = self
+            .client
+            .lock()
+            .await
+            .txn(transaction)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        if !response.succeeded() {
+            return Err(ApiError::Conflict {
+                resource: reference,
+            });
+        }
+        bound.metadata.resource_version = Some(response_revision(&response)?);
+        Ok(bound)
+    }
+
     pub async fn delete(
         &self,
         namespace: &str,

@@ -991,6 +991,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-scheduler"
+version = "0.1.0"
+dependencies = [
+ "rusternetes-api-types",
+ "rusternetes-common",
+ "rusternetes-controller-runtime",
+ "rusternetes-storage",
+ "rusternetes-storage-etcd",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "rusternetes-storage"
 version = "0.1.0"
 dependencies = [
