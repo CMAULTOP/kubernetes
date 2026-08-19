@@ -5,9 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts, RsaPublicKey};
 use rusternetes_common::ApiError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 /// Kubernetes request identity established before authorization.
@@ -69,6 +71,93 @@ pub enum AnonymousPolicy {
 pub struct ServiceAccountJwtKey {
     pub key_id: Option<String>,
     pub rsa_public_key_pem: String,
+}
+
+/// OIDC discovery document advertised for configured ServiceAccount signing keys.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceAccountOidcDiscoveryDocument {
+    pub issuer: String,
+    pub jwks_uri: String,
+    pub response_types_supported: Vec<String>,
+    pub subject_types_supported: Vec<String>,
+    pub id_token_signing_alg_values_supported: Vec<String>,
+}
+
+/// JSON Web Key Set published for configured ServiceAccount verification keys.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceAccountJwksDocument {
+    pub keys: Vec<ServiceAccountRsaJwk>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceAccountRsaJwk {
+    pub kty: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    #[serde(rename = "use")]
+    pub key_use: String,
+    pub alg: String,
+    pub n: String,
+    pub e: String,
+}
+
+/// OIDC metadata and JWKS material derived from the exact configured verification keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAccountOidcDiscovery {
+    document: ServiceAccountOidcDiscoveryDocument,
+    jwks: ServiceAccountJwksDocument,
+}
+
+impl ServiceAccountOidcDiscovery {
+    pub fn new(
+        issuer: impl Into<String>,
+        jwks_uri: impl Into<String>,
+        keys: &[ServiceAccountJwtKey],
+    ) -> Result<Self, ApiError> {
+        let issuer = issuer.into();
+        let jwks_uri = jwks_uri.into();
+        if !issuer.starts_with("https://") || !jwks_uri.starts_with("https://") || keys.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount OIDC issuer, JWKS URI and verification keys must be HTTPS and non-empty"
+                    .to_owned(),
+            });
+        }
+        let mut jwks = Vec::with_capacity(keys.len());
+        for key in keys {
+            let public_key =
+                RsaPublicKey::from_public_key_pem(&key.rsa_public_key_pem).map_err(|_| {
+                    ApiError::Invalid {
+                        message: "configured ServiceAccount OIDC public key is invalid".to_owned(),
+                    }
+                })?;
+            jwks.push(ServiceAccountRsaJwk {
+                kty: "RSA".to_owned(),
+                kid: key.key_id.clone(),
+                key_use: "sig".to_owned(),
+                alg: "RS256".to_owned(),
+                n: URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                e: URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+            });
+        }
+        Ok(Self {
+            document: ServiceAccountOidcDiscoveryDocument {
+                issuer,
+                jwks_uri,
+                response_types_supported: vec!["id_token".to_owned()],
+                subject_types_supported: vec!["public".to_owned()],
+                id_token_signing_alg_values_supported: vec!["RS256".to_owned()],
+            },
+            jwks: ServiceAccountJwksDocument { keys: jwks },
+        })
+    }
+
+    pub fn document(&self) -> &ServiceAccountOidcDiscoveryDocument {
+        &self.document
+    }
+
+    pub fn jwks(&self) -> &ServiceAccountJwksDocument {
+        &self.jwks
+    }
 }
 
 /// Cryptographically verified Kubernetes ServiceAccount JWT claims.
@@ -143,6 +232,14 @@ impl ServiceAccountJwtVerifier {
             audiences,
             keys,
         })
+    }
+
+    pub fn oidc_discovery(
+        &self,
+        issuer: impl Into<String>,
+        jwks_uri: impl Into<String>,
+    ) -> Result<ServiceAccountOidcDiscovery, ApiError> {
+        ServiceAccountOidcDiscovery::new(issuer, jwks_uri, &self.keys)
     }
 
     pub fn verify(&self, token: &str) -> Result<VerifiedServiceAccountJwt, ApiError> {
@@ -231,6 +328,7 @@ pub struct AuthenticationChain {
     anonymous_policy: AnonymousPolicy,
     static_bearer_tokens: Vec<StaticBearerToken>,
     service_account_jwt_verifier: Option<ServiceAccountJwtVerifier>,
+    service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
 }
 
 impl AuthenticationChain {
@@ -242,6 +340,7 @@ impl AuthenticationChain {
             anonymous_policy,
             static_bearer_tokens,
             service_account_jwt_verifier: None,
+            service_account_oidc_discovery: None,
         }
     }
 
@@ -257,6 +356,27 @@ impl AuthenticationChain {
 
     pub fn service_account_jwt_verifier(&self) -> Option<&ServiceAccountJwtVerifier> {
         self.service_account_jwt_verifier.as_ref()
+    }
+
+    /// Enables OIDC discovery derived from the same configured ServiceAccount JWT verifier keys.
+    pub fn with_service_account_oidc_discovery(
+        mut self,
+        issuer: impl Into<String>,
+        jwks_uri: impl Into<String>,
+    ) -> Result<Self, ApiError> {
+        let verifier =
+            self.service_account_jwt_verifier
+                .as_ref()
+                .ok_or_else(|| ApiError::Invalid {
+                    message: "ServiceAccount JWT verifier must be configured before OIDC discovery"
+                        .to_owned(),
+                })?;
+        self.service_account_oidc_discovery = Some(verifier.oidc_discovery(issuer, jwks_uri)?);
+        Ok(self)
+    }
+
+    pub fn service_account_oidc_discovery(&self) -> Option<&ServiceAccountOidcDiscovery> {
+        self.service_account_oidc_discovery.as_ref()
     }
 
     /// Verifies an explicitly presented ServiceAccount JWT when this chain has been configured
@@ -342,6 +462,38 @@ mod tests {
             verifier.verify("not-a-jwt"),
             Err(ApiError::Unauthorized { .. })
         ));
+    }
+
+    #[test]
+    fn oidc_discovery_requires_verifier_and_publishes_configured_rsa_key() {
+        const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAht2MPPSji0Vrbgk/gCyZ\nDLAfFNHUx7R697SBlj2meld3M7DUf5IVa4C9BxyTf2uhb35JNPAW0TYgQ9bg4n4/\n5DD8dFz1soqSHumaMO7a969VwHtJO5cPYAkKqXiGSxwkTQiF4MSmaoCvPlMkYF0/\n21stDUJkJcHr1VLsQfK5X660tdK9suWeW6zxYidwWCt94LalQ85lOcZjw3YfKymX\nnRrCWNPUme7dLFo2lBJ/K2wNuucUZXPGg50aeEgmr4OVTPxVApRL5b85taacmbGu\nXVy/oaUvF0M3iDkRgZNKN0vZPNvP4tc+KF/+DWDO1msmFYkiiG6848zqtRnY0DJ6\nyQIDAQAB\n-----END PUBLIC KEY-----\n";
+        assert!(AuthenticationChain::default()
+            .with_service_account_oidc_discovery(
+                "https://issuer.example",
+                "https://issuer.example/openid/v1/jwks"
+            )
+            .is_err());
+        let verifier = ServiceAccountJwtVerifier::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            vec![ServiceAccountJwtKey {
+                key_id: Some("active".to_owned()),
+                rsa_public_key_pem: PUBLIC_KEY.to_owned(),
+            }],
+        )
+        .expect("valid public verification key");
+        let discovery = verifier
+            .oidc_discovery(
+                "https://issuer.example",
+                "https://issuer.example/openid/v1/jwks",
+            )
+            .expect("OIDC document derives from verifier key");
+        assert_eq!(discovery.document().issuer, "https://issuer.example");
+        assert_eq!(discovery.jwks().keys.len(), 1);
+        assert_eq!(discovery.jwks().keys[0].kid.as_deref(), Some("active"));
+        assert_eq!(discovery.jwks().keys[0].kty, "RSA");
+        assert!(!discovery.jwks().keys[0].n.is_empty());
+        assert!(!discovery.jwks().keys[0].e.is_empty());
     }
 
     #[derive(serde::Serialize)]

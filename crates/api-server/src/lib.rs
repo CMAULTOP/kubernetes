@@ -21,7 +21,10 @@ use rusternetes_api_types::{
     ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
     Node, Pod, ServiceAccount,
 };
-use rusternetes_authn::{AuthenticationChain, RequestIdentity, VerifiedServiceAccountJwt};
+use rusternetes_authn::{
+    AuthenticationChain, RequestIdentity, ServiceAccountJwksDocument, ServiceAccountOidcDiscovery,
+    ServiceAccountOidcDiscoveryDocument, VerifiedServiceAccountJwt,
+};
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
@@ -559,6 +562,7 @@ pub struct AppState {
     registry: ApiRegistry,
     authorization: AuthorizationMode,
     admission: AdmissionChain,
+    service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
 }
 
 impl AppState {
@@ -582,6 +586,7 @@ impl AppState {
             registry,
             authorization,
             admission,
+            service_account_oidc_discovery: None,
         }
     }
 }
@@ -671,12 +676,13 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
     authorization: AuthorizationMode,
     admission: AdmissionChain,
 ) -> Router {
-    let state = AppState::with_registry_authorization_and_admission(
+    let mut state = AppState::with_registry_authorization_and_admission(
         backend,
         ApiRegistry::core_v1(),
         authorization,
         admission,
     );
+    state.service_account_oidc_discovery = authentication.service_account_oidc_discovery().cloned();
     let authentication_state = AuthenticationState {
         chain: authentication,
         service_accounts: state.backend.service_accounts.clone(),
@@ -684,6 +690,11 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         nodes: state.backend.nodes.clone(),
     };
     Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(service_account_oidc_discovery),
+        )
+        .route("/openid/v1/jwks", get(service_account_jwks))
         .route("/version", get(version))
         .route("/api", get(api_versions))
         .route("/api/v1", get(core_v1_api_resources))
@@ -876,11 +887,21 @@ async fn ensure_default_namespace(backend: &NamespaceBackend) -> Result<(), ApiE
     }
 }
 
+fn is_service_account_oidc_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/.well-known/openid-configuration" | "/openid/v1/jwks"
+    )
+}
+
 async fn authenticate_request(
     State(authentication): State<AuthenticationState>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    if is_service_account_oidc_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     let authorization = match request.headers().get(header::AUTHORIZATION) {
         Some(value) => match value.to_str() {
             Ok(value) => Some(value),
@@ -989,6 +1010,9 @@ async fn authorize_request(
     request: Request,
     next: Next,
 ) -> Response {
+    if is_service_account_oidc_path(request.uri().path()) {
+        return next.run(request).await;
+    }
     match &state.authorization {
         AuthorizationMode::AlwaysAllow => next.run(request).await,
         AuthorizationMode::Rbac(authorizer) => {
@@ -1098,6 +1122,40 @@ struct VersionInfo {
     go_version: &'static str,
     compiler: &'static str,
     platform: &'static str,
+}
+
+async fn service_account_oidc_discovery(
+    State(state): State<AppState>,
+) -> Result<Json<ServiceAccountOidcDiscoveryDocument>, ApiRejection> {
+    let discovery = state
+        .service_account_oidc_discovery
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound {
+            resource: ResourceReference {
+                group: "authentication.k8s.io".to_owned(),
+                resource: "openid-configuration".to_owned(),
+                namespace: None,
+                name: None,
+            },
+        })?;
+    Ok(Json(discovery.document().clone()))
+}
+
+async fn service_account_jwks(
+    State(state): State<AppState>,
+) -> Result<Json<ServiceAccountJwksDocument>, ApiRejection> {
+    let discovery = state
+        .service_account_oidc_discovery
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound {
+            resource: ResourceReference {
+                group: "authentication.k8s.io".to_owned(),
+                resource: "openid/v1/jwks".to_owned(),
+                namespace: None,
+                name: None,
+            },
+        })?;
+    Ok(Json(discovery.jwks().clone()))
 }
 
 async fn version() -> Json<VersionInfo> {
@@ -2123,12 +2181,74 @@ mod tests {
     };
     use rusternetes_api_types::{Container, Node, ObjectMeta, Pod, PodSpec, TypeMeta};
     use rusternetes_authn::{
-        AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken,
+        AnonymousPolicy, AuthenticationChain, RequestIdentity, ServiceAccountJwtKey,
+        ServiceAccountJwtVerifier, StaticBearerToken,
     };
     use rusternetes_common::StatusReason;
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn oidc_discovery_and_jwks_publish_only_configured_service_account_keys() {
+        const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAht2MPPSji0Vrbgk/gCyZ\nDLAfFNHUx7R697SBlj2meld3M7DUf5IVa4C9BxyTf2uhb35JNPAW0TYgQ9bg4n4/\n5DD8dFz1soqSHumaMO7a969VwHtJO5cPYAkKqXiGSxwkTQiF4MSmaoCvPlMkYF0/\n21stDUJkJcHr1VLsQfK5X660tdK9suWeW6zxYidwWCt94LalQ85lOcZjw3YfKymX\nnRrCWNPUme7dLFo2lBJ/K2wNuucUZXPGg50aeEgmr4OVTPxVApRL5b85taacmbGu\nXVy/oaUvF0M3iDkRgZNKN0vZPNvP4tc+KF/+DWDO1msmFYkiiG6848zqtRnY0DJ6\nyQIDAQAB\n-----END PUBLIC KEY-----\n";
+        let verifier = ServiceAccountJwtVerifier::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            vec![ServiceAccountJwtKey {
+                key_id: Some("active".to_owned()),
+                rsa_public_key_pem: PUBLIC_KEY.to_owned(),
+            }],
+        )
+        .expect("verification configuration is valid");
+        let authentication = AuthenticationChain::new(AnonymousPolicy::Deny, Vec::new())
+            .with_service_account_jwt_verifier(verifier)
+            .with_service_account_oidc_discovery(
+                "https://issuer.example",
+                "https://issuer.example/openid/v1/jwks",
+            )
+            .expect("OIDC discovery is derived from configured verifier");
+        let app = router_with_backend_and_auth(
+            ConfigMapBackend::InMemory(Arc::new(InMemoryConfigMapStore::new())),
+            authentication,
+        );
+        let discovery = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/openid-configuration")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let document: serde_json::Value = serde_json::from_slice(
+            &to_bytes(discovery.into_body(), usize::MAX)
+                .await
+                .expect("discovery body is readable"),
+        )
+        .expect("discovery is JSON");
+        assert_eq!(document["issuer"], "https://issuer.example");
+        assert_eq!(
+            document["jwks_uri"],
+            "https://issuer.example/openid/v1/jwks"
+        );
+
+        let app = router_with_backend_and_auth(
+            ConfigMapBackend::InMemory(Arc::new(InMemoryConfigMapStore::new())),
+            AuthenticationChain::default(),
+        );
+        let disabled = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openid/v1/jwks")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+    }
 
     #[tokio::test]
     async fn live_service_account_identity_requires_current_matching_uid() {

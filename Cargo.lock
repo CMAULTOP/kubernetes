@@ -1429,7 +1429,9 @@ dependencies = [
 name = "rusternetes-authn"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "jsonwebtoken",
+ "rsa",
  "rusternetes-common",
  "serde",
  "subtle",
