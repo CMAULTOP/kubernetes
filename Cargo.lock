@@ -889,6 +889,7 @@ dependencies = [
  "rusternetes-api-types",
  "rusternetes-common",
  "rusternetes-storage",
+ "rusternetes-storage-etcd",
  "serde",
  "serde_json",
  "tokio",
@@ -926,8 +927,10 @@ dependencies = [
  "rusternetes-api-types",
  "rusternetes-common",
  "rusternetes-storage",
+ "rusternetes-storage-etcd",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

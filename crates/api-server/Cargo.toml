@@ -13,6 +13,7 @@ http.workspace = true
 rusternetes-api-types = { path = "../api-types" }
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
+rusternetes-storage-etcd = { path = "../storage-etcd" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

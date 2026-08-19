@@ -16,24 +16,110 @@ use rusternetes_api_types::{
     LabelSelector,
 };
 use rusternetes_common::{ApiError, ResourceReference};
-use rusternetes_storage::{ConfigMapWatchRequest, InMemoryConfigMapStore};
+use rusternetes_storage::{
+    ConfigMapWatchRequest, ConfigMapWatchSubscription, DeleteResult, InMemoryConfigMapStore,
+};
+use rusternetes_storage_etcd::EtcdConfigMapRepository;
 use serde::{Deserialize, Serialize};
 
-/// Shared immutable application state. The storage crate remains the sole owner of mutable data.
+/// The ConfigMap persistence implementation selected when building an API Server router.
+///
+/// The enum is intentionally closed for this phase: all HTTP handlers retain one public contract
+/// while backend-specific semantics remain explicit. The etcd variant never falls back to memory.
 #[derive(Clone)]
-pub struct AppState {
-    store: Arc<InMemoryConfigMapStore>,
+pub enum ConfigMapBackend {
+    InMemory(Arc<InMemoryConfigMapStore>),
+    Etcd(Arc<EtcdConfigMapRepository>),
 }
 
-impl AppState {
-    pub fn new(store: Arc<InMemoryConfigMapStore>) -> Self {
-        Self { store }
+impl ConfigMapBackend {
+    async fn create(&self, resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+        match self {
+            Self::InMemory(store) => store.create(resource).await,
+            Self::Etcd(repository) => repository.create(resource).await,
+        }
+    }
+
+    async fn get(&self, namespace: &str, name: &str) -> Result<ConfigMap, ApiError> {
+        match self {
+            Self::InMemory(store) => store.get(namespace, name).await,
+            Self::Etcd(repository) => repository.get(namespace, name).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        namespace: Option<&str>,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<rusternetes_api_types::ConfigMapList, ApiError> {
+        match (self, namespace) {
+            (Self::InMemory(store), namespace) => {
+                Ok(store.list(namespace, label_selector, field_selector).await)
+            }
+            (Self::Etcd(repository), Some(namespace)) => {
+                repository
+                    .list(namespace, label_selector, field_selector)
+                    .await
+            }
+            (Self::Etcd(repository), None) => {
+                repository.list_all(label_selector, field_selector).await
+            }
+        }
+    }
+
+    async fn update(&self, resource: ConfigMap) -> Result<ConfigMap, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update(resource).await,
+            Self::Etcd(repository) => repository.update(resource).await,
+        }
+    }
+
+    async fn delete(
+        &self,
+        namespace: &str,
+        name: &str,
+        options: DeleteOptions,
+    ) -> Result<DeleteResult, ApiError> {
+        match self {
+            Self::InMemory(store) => store.delete(namespace, name, options).await,
+            Self::Etcd(repository) => repository.delete(namespace, name, options).await,
+        }
+    }
+
+    async fn watch(
+        &self,
+        request: ConfigMapWatchRequest,
+    ) -> Result<ConfigMapWatchSubscription, ApiError> {
+        match self {
+            Self::InMemory(store) => store.watch(request).await,
+            Self::Etcd(_) => Err(ApiError::BadRequest {
+                message: "watch=true is not yet implemented for the etcd backend; durable WATCH requires a separate end-to-end integration".to_owned(),
+            }),
+        }
     }
 }
 
-/// Builds the API server router with only the operations this vertical slice actually supports.
+/// Shared immutable application state. The selected backend remains the sole owner of data.
+#[derive(Clone)]
+pub struct AppState {
+    backend: ConfigMapBackend,
+}
+
+impl AppState {
+    pub fn new(backend: ConfigMapBackend) -> Self {
+        Self { backend }
+    }
+}
+
+/// Builds an API Server router using the current in-memory development backend.
 pub fn router(store: Arc<InMemoryConfigMapStore>) -> Router {
-    let state = AppState::new(store);
+    router_with_backend(ConfigMapBackend::InMemory(store))
+}
+
+/// Builds the API Server router with an explicitly selected ConfigMap persistence backend.
+pub fn router_with_backend(backend: ConfigMapBackend) -> Router {
+    let state = AppState::new(backend);
     Router::new()
         .route("/version", get(version))
         .route("/api", get(api_versions))
@@ -51,6 +137,37 @@ pub fn router(store: Arc<InMemoryConfigMapStore>) -> Router {
         )
         .fallback(not_found)
         .with_state(state)
+}
+
+/// Selects an API Server backend from optional process configuration values.
+///
+/// Absence (or whitespace-only content) selects the development in-memory store. A non-empty etcd
+/// setting is fail-closed: connection errors are returned to the caller instead of silently
+/// falling back to volatile state.
+pub async fn backend_from_etcd_config(
+    endpoints: Option<&str>,
+    key_prefix: Option<&str>,
+) -> Result<ConfigMapBackend, ApiError> {
+    let Some(endpoints) = endpoints.filter(|value| !value.trim().is_empty()) else {
+        return Ok(ConfigMapBackend::InMemory(Arc::new(
+            InMemoryConfigMapStore::new(),
+        )));
+    };
+    let endpoints = endpoints
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "RUSTERNETES_ETCD_ENDPOINTS must contain at least one non-empty endpoint"
+                .to_owned(),
+        });
+    }
+    let key_prefix = key_prefix.filter(|value| !value.trim().is_empty());
+    let repository = EtcdConfigMapRepository::connect(endpoints, key_prefix).await?;
+    Ok(ConfigMapBackend::Etcd(Arc::new(repository)))
 }
 
 /// A local response wrapper makes the API error representation available to Axum without
@@ -136,9 +253,9 @@ async fn list_all_config_maps(
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
         state
-            .store
+            .backend
             .list(None, &label_selector, &field_selector)
-            .await,
+            .await?,
     )
     .into_response())
 }
@@ -156,9 +273,9 @@ async fn list_config_maps(
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
         state
-            .store
+            .backend
             .list(Some(&namespace), &label_selector, &field_selector)
-            .await,
+            .await?,
     )
     .into_response())
 }
@@ -169,7 +286,7 @@ async fn create_config_map(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<ConfigMap>)> {
     let resource = bind_namespace(decode_config_map(body)?, &namespace)?;
-    let created = state.store.create(resource).await?;
+    let created = state.backend.create(resource).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -177,7 +294,7 @@ async fn get_config_map(
     State(state): State<AppState>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> ApiResult<Json<ConfigMap>> {
-    Ok(Json(state.store.get(&namespace, &name).await?))
+    Ok(Json(state.backend.get(&namespace, &name).await?))
 }
 
 async fn replace_config_map(
@@ -186,7 +303,7 @@ async fn replace_config_map(
     body: Bytes,
 ) -> ApiResult<Json<ConfigMap>> {
     let resource = bind_update_identity(decode_config_map(body)?, &namespace, &name)?;
-    Ok(Json(state.store.update(resource).await?))
+    Ok(Json(state.backend.update(resource).await?))
 }
 
 async fn delete_config_map(
@@ -195,7 +312,7 @@ async fn delete_config_map(
     body: Bytes,
 ) -> ApiResult<Json<ApiStatus>> {
     let options = decode_delete_options(body)?;
-    let result = state.store.delete(&namespace, &name, options).await?;
+    let result = state.backend.delete(&namespace, &name, options).await?;
     Ok(Json(ApiStatus::success(format!(
         "configmaps {name:?} deleted at resourceVersion {}",
         result.resource_version
@@ -222,7 +339,7 @@ async fn open_config_map_watch(
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     let subscription = state
-        .store
+        .backend
         .watch(ConfigMapWatchRequest {
             namespace,
             label_selector,
@@ -274,7 +391,7 @@ fn reject_list_resource_version(query: &ListQuery) -> ApiResult<()> {
     Ok(())
 }
 
-fn watch_response(subscription: rusternetes_storage::ConfigMapWatchSubscription) -> Response {
+fn watch_response(subscription: ConfigMapWatchSubscription) -> Response {
     let event_stream = stream! {
         let mut subscription = subscription;
         while let Some(event) = subscription.recv().await {
@@ -396,5 +513,21 @@ mod tests {
         let created: ConfigMap = serde_json::from_slice(&bytes)
             .unwrap_or_else(|error| panic!("response is a ConfigMap: {error}"));
         assert_eq!(created.metadata.namespace.as_deref(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn absent_etcd_endpoints_select_in_memory_backend() {
+        let backend = backend_from_etcd_config(None, None)
+            .await
+            .expect("default backend is available");
+        assert!(matches!(backend, ConfigMapBackend::InMemory(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_etcd_prefix_fails_closed_before_server_startup() {
+        assert!(matches!(
+            backend_from_etcd_config(Some("http://127.0.0.1:2379"), Some("invalid-prefix")).await,
+            Err(ApiError::BadRequest { .. })
+        ));
     }
 }

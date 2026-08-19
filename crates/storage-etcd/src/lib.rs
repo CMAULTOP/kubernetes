@@ -95,27 +95,26 @@ impl EtcdConfigMapRepository {
         label_selector: &LabelSelector,
         field_selector: &FieldSelector,
     ) -> Result<ConfigMapList, ApiError> {
-        let namespace_prefix = format!("{}/", self.namespace_prefix(namespace)?);
-        let response = self
-            .client
-            .lock()
-            .await
-            .get(namespace_prefix, Some(GetOptions::new().with_prefix()))
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        let revision = response_revision(&response)?;
-        let items = response
-            .kvs()
-            .iter()
-            .map(|key_value| decode(key_value.value(), key_value.mod_revision()))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|resource| {
-                label_selector.matches(&resource.metadata.labels)
-                    && field_selector.matches(resource)
-            })
-            .collect();
-        Ok(ConfigMapList::new(revision, items))
+        self.list_prefix(
+            format!("{}/", self.namespace_prefix(namespace)?),
+            label_selector,
+            field_selector,
+        )
+        .await
+    }
+
+    /// Lists ConfigMaps from every namespace under this repository's dedicated etcd prefix.
+    pub async fn list_all(
+        &self,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<ConfigMapList, ApiError> {
+        self.list_prefix(
+            format!("{}/", self.key_prefix),
+            label_selector,
+            field_selector,
+        )
+        .await
     }
 
     /// Replaces a ConfigMap through an atomic mod-revision comparison.
@@ -203,6 +202,34 @@ impl EtcdConfigMapRepository {
         Ok(DeleteResult {
             resource_version: response_revision(&response)?,
         })
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: String,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<ConfigMapList, ApiError> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .get(prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let revision = response_revision(&response)?;
+        let items = response
+            .kvs()
+            .iter()
+            .map(|key_value| decode(key_value.value(), key_value.mod_revision()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|resource| {
+                label_selector.matches(&resource.metadata.labels)
+                    && field_selector.matches(resource)
+            })
+            .collect();
+        Ok(ConfigMapList::new(revision, items))
     }
 
     async fn get_stored(&self, namespace: &str, name: &str) -> Result<StoredConfigMap, ApiError> {
