@@ -163,7 +163,9 @@ impl ApiRegistry {
                     singular: "node",
                     kind: "Node",
                     scope: ResourceScope::Cluster,
-                    verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    verbs: &[
+                        "create", "delete", "get", "list", "patch", "update", "watch",
+                    ],
                     subresources: &[SubresourceStrategy {
                         name: "status",
                         discovery_name: "nodes/status",

@@ -482,6 +482,49 @@ async fn node_status_update_is_durable_cas_guarded_and_watch_visible() {
 }
 
 #[tokio::test]
+async fn node_patch_is_durable_and_preserves_status_projection() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-node-patch/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let nodes = EtcdNodeRepository::connect([endpoint.as_str()], Some(&format!("{prefix}/nodes")))
+        .await
+        .expect("direct Node repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/nodes", server.base_url);
+
+    let created_response = client
+        .post(&collection)
+        .json(&node("node-a"))
+        .send()
+        .await
+        .expect("Node create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Node = created_response.json().await.expect("typed Node response");
+
+    let patch_response = client
+        .patch(format!("{collection}/node-a"))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"unschedulable":true},"status":{"ready":false}}"#)
+        .send()
+        .await
+        .expect("durable Node PATCH completes");
+    assert_eq!(patch_response.status(), reqwest::StatusCode::OK);
+    let patched: Node = patch_response.json().await.expect("typed PATCH response");
+    assert!(patched.spec.unschedulable);
+    assert!(patched.status.ready);
+    assert_ne!(
+        patched.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let persisted = nodes.get("node-a").await.expect("direct etcd Node read");
+    assert_eq!(persisted, patched);
+}
+
+#[tokio::test]
 async fn http_watch_reports_410_when_etcd_history_is_compacted() {
     let (_etcd, endpoint) = start_etcd().await;
     let prefix = format!("/rusternetes-http-watch-compaction/{}", Uuid::new_v4());

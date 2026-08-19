@@ -591,12 +591,6 @@ impl Node {
                 message: "Node identity is immutable after registration".to_owned(),
             });
         }
-        if self.status != previous.status {
-            return Err(ApiError::Invalid {
-                message: "Node status is server-owned; use the future /status subresource"
-                    .to_owned(),
-            });
-        }
         Ok(())
     }
 

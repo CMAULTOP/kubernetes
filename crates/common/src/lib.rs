@@ -30,6 +30,8 @@ pub enum StatusReason {
     NotFound,
     #[serde(rename = "Unauthorized")]
     Unauthorized,
+    #[serde(rename = "UnsupportedMediaType")]
+    UnsupportedMediaType,
 }
 
 /// A typed reference to the resource named by an API operation.
@@ -110,6 +112,8 @@ pub enum ApiError {
     Unauthorized { message: String },
     #[error("unsupported HTTP method: {method}")]
     MethodNotAllowed { method: String },
+    #[error("unsupported media type: {media_type}")]
+    UnsupportedMediaType { media_type: String },
     #[error("internal server error")]
     Internal,
 }
@@ -126,6 +130,7 @@ impl ApiError {
             Self::NotFound { .. } => StatusReason::NotFound,
             Self::Unauthorized { .. } => StatusReason::Unauthorized,
             Self::MethodNotAllowed { .. } => StatusReason::MethodNotAllowed,
+            Self::UnsupportedMediaType { .. } => StatusReason::UnsupportedMediaType,
             Self::Internal => StatusReason::InternalError,
         }
     }
@@ -140,6 +145,7 @@ impl ApiError {
             Self::NotFound { .. } => 404,
             Self::Unauthorized { .. } => 401,
             Self::MethodNotAllowed { .. } => 405,
+            Self::UnsupportedMediaType { .. } => 415,
             Self::Internal => 500,
         }
     }
@@ -155,6 +161,7 @@ impl ApiError {
             | Self::ResourceExpired { .. }
             | Self::Unauthorized { .. }
             | Self::MethodNotAllowed { .. }
+            | Self::UnsupportedMediaType { .. }
             | Self::Internal => None,
         }
     }

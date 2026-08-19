@@ -9,7 +9,7 @@ Node status is an executable cluster-scoped core/v1 subresource at `GET` and `PU
 |---|---|
 | Request shape | The endpoint accepts a full typed `Node` object and requires that `metadata.name` match the URI. |
 | Writable projection | Only `status` from the submitted object is committed. `spec`, labels, identity, UID, creation timestamp, generation, and type metadata remain from the persisted Node. |
-| Main resource route | `PUT /api/v1/nodes/{name}` continues to reject direct status changes; callers must use `/status`. |
+| Main resource route | `PUT` and `PATCH /api/v1/nodes/{name}` ignore submitted status changes; callers use `/status` when they intend to mutate status. |
 | Concurrency | Status and main resource share one `metadata.resourceVersion`; stale status writes receive Kubernetes `409 Conflict`. |
 | Persistence | In-memory storage performs the update under its write lock. etcd storage reads the current object, validates the supplied version, and commits a compare-on-mod-revision transaction. |
 | WATCH | A successful status update advances the shared revision and produces one typed `MODIFIED` Node event in both in-memory and etcd watch paths. |

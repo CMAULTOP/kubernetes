@@ -6,7 +6,7 @@ use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
     extract::{Extension, Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -38,6 +38,7 @@ use rusternetes_storage_etcd::{
     EtcdPodRepository, EtcdPodWatchSubscription,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// The ConfigMap persistence implementation selected when building an API Server router.
 ///
@@ -578,7 +579,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route("/api/v1/nodes", get(list_nodes).post(create_node))
         .route(
             "/api/v1/nodes/:name",
-            get(get_node).put(replace_node).delete(delete_node),
+            get(get_node)
+                .put(replace_node)
+                .patch(patch_node)
+                .delete(delete_node),
         )
         .route(
             "/api/v1/nodes/:name/status",
@@ -1222,6 +1226,17 @@ async fn replace_node(
     Ok(Json(state.backend.nodes.update(resource).await?))
 }
 
+async fn patch_node(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Node>> {
+    let current = state.backend.nodes.get(&name).await?;
+    let patched = bind_node_update_identity(apply_node_patch(current, &headers, body)?, &name)?;
+    Ok(Json(state.backend.nodes.update(patched).await?))
+}
+
 async fn get_node_status(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1518,6 +1533,75 @@ fn decode_namespace(body: Bytes) -> ApiResult<Namespace> {
 
 fn decode_node(body: Bytes) -> ApiResult<Node> {
     decode_typed_resource(body, "Node")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodePatchFormat {
+    JsonPatch,
+    MergePatch,
+}
+
+fn apply_node_patch(current: Node, headers: &HeaderMap, body: Bytes) -> ApiResult<Node> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a Node PATCH request body is required".to_owned(),
+        }
+        .into());
+    }
+    let mut document = serde_json::to_value(current).map_err(|_| ApiError::Internal)?;
+    match node_patch_format(headers)? {
+        NodePatchFormat::JsonPatch => {
+            let patch: json_patch::Patch =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Patch document: {error}"),
+                })?;
+            json_patch::patch(&mut document, &patch).map_err(|error| ApiError::Invalid {
+                message: format!("JSON Patch could not be applied: {error}"),
+            })?;
+        }
+        NodePatchFormat::MergePatch => {
+            let patch: Value =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Merge Patch document: {error}"),
+                })?;
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest {
+                    message: "JSON Merge Patch document must be an object".to_owned(),
+                }
+                .into());
+            }
+            json_patch::merge(&mut document, &patch);
+        }
+    }
+    serde_json::from_value(document).map_err(|error| {
+        ApiError::Invalid {
+            message: format!("PATCH result is not a valid Node: {error}"),
+        }
+        .into()
+    })
+}
+
+fn node_patch_format(headers: &HeaderMap) -> ApiResult<NodePatchFormat> {
+    let Some(raw) = headers.get(header::CONTENT_TYPE) else {
+        return Err(ApiError::UnsupportedMediaType {
+            media_type: "<missing>".to_owned(),
+        }
+        .into());
+    };
+    let raw = raw.to_str().map_err(|_| ApiError::UnsupportedMediaType {
+        media_type: "<invalid HTTP header>".to_owned(),
+    })?;
+    let media_type = raw
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "application/json-patch+json" => Ok(NodePatchFormat::JsonPatch),
+        "application/merge-patch+json" => Ok(NodePatchFormat::MergePatch),
+        _ => Err(ApiError::UnsupportedMediaType { media_type }.into()),
+    }
 }
 
 fn decode_typed_resource<T: serde::de::DeserializeOwned>(body: Bytes, kind: &str) -> ApiResult<T> {

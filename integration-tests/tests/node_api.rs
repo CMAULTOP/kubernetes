@@ -88,6 +88,102 @@ async fn node_watch_replays_typed_creation_event_over_http() {
 }
 
 #[tokio::test]
+async fn node_patch_supports_rfc_merge_and_json_patch_without_bypassing_status_or_watch() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/nodes", server.base_url);
+    let created_response = client
+        .post(&collection)
+        .json(&node("node-a"))
+        .send()
+        .await
+        .expect("create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Node = created_response.json().await.expect("typed Node response");
+    let resource_version = created
+        .metadata
+        .resource_version
+        .as_deref()
+        .expect("created Node has resourceVersion");
+
+    let watch_response = client
+        .get(format!(
+            "{collection}?watch=true&resourceVersion={resource_version}"
+        ))
+        .send()
+        .await
+        .expect("watch opens");
+    assert_eq!(watch_response.status(), reqwest::StatusCode::OK);
+    let mut watch = watch_response.bytes_stream();
+
+    let merge_response = client
+        .patch(format!("{collection}/node-a"))
+        .header(
+            "content-type",
+            "application/merge-patch+json; charset=utf-8",
+        )
+        .body(r#"{"spec":{"unschedulable":true},"status":{"ready":false}}"#)
+        .send()
+        .await
+        .expect("merge patch completes");
+    assert_eq!(merge_response.status(), reqwest::StatusCode::OK);
+    let merged: Node = merge_response
+        .json()
+        .await
+        .expect("typed merge patch response");
+    assert!(merged.spec.unschedulable);
+    assert!(merged.status.ready);
+    assert_ne!(
+        merged.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let event = watch
+        .next()
+        .await
+        .expect("PATCH produces a watch event")
+        .expect("watch payload is valid");
+    let event: serde_json::Value = serde_json::from_slice(&event).expect("watch event is JSON");
+    assert_eq!(event["type"], "MODIFIED");
+    assert_eq!(event["object"]["spec"]["unschedulable"], true);
+    assert_eq!(event["object"]["status"]["ready"], true);
+
+    let json_patch_response = client
+        .patch(format!("{collection}/node-a"))
+        .header("content-type", "application/json-patch+json")
+        .body(r#"[{"op":"replace","path":"/metadata/labels/role","value":"control-plane"}]"#)
+        .send()
+        .await
+        .expect("JSON Patch completes");
+    assert_eq!(json_patch_response.status(), reqwest::StatusCode::OK);
+    let json_patched: Node = json_patch_response
+        .json()
+        .await
+        .expect("typed JSON Patch response");
+    assert_eq!(
+        json_patched.metadata.labels.get("role"),
+        Some(&"control-plane".to_owned())
+    );
+    assert!(json_patched.status.ready);
+
+    let unsupported_response = client
+        .patch(format!("{collection}/node-a"))
+        .header("content-type", "application/strategic-merge-patch+json")
+        .body(r#"{"spec":{"unschedulable":false}}"#)
+        .send()
+        .await
+        .expect("unsupported PATCH completes");
+    assert_eq!(
+        unsupported_response.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        status(unsupported_response).await.reason,
+        StatusReason::UnsupportedMediaType
+    );
+}
+
+#[tokio::test]
 async fn node_status_subresource_preserves_spec_enforces_cas_and_emits_watch_update() {
     let server = start_server().await;
     let client = reqwest::Client::new();
@@ -201,6 +297,7 @@ async fn core_v1_node_crud_is_executable_with_server_owned_status_and_cas() {
     update.spec = NodeSpec {
         unschedulable: true,
     };
+    update.status.ready = false;
     let update_response = client
         .put(format!("{collection}/node-a"))
         .json(&update)
@@ -213,6 +310,7 @@ async fn core_v1_node_crud_is_executable_with_server_owned_status_and_cas() {
         .await
         .expect("typed Node update response");
     assert!(updated.spec.unschedulable);
+    assert!(updated.status.ready);
     assert_ne!(
         updated.metadata.resource_version,
         created.metadata.resource_version

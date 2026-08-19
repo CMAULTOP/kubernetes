@@ -31,6 +31,7 @@ etcd-client = "=0.16.0"
 futures-util = "=0.3.34"
 http = "=1.2.0"
 idna_adapter = "=1.1.0"
+json-patch = "=4.2.0"
 reqwest = { version = "=0.12.12", default-features = false, features = ["json", "stream"] }
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_json = "=1.0.134"
