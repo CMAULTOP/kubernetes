@@ -734,6 +734,31 @@ impl Pod {
         preserve_server_metadata(&mut self.metadata, &previous.metadata, resource_version);
         self.status = previous.status.clone();
     }
+
+    /// Validates immutable identity fields supplied to the dedicated `/status` endpoint.
+    ///
+    /// The persistence layer restores the full server-owned metadata and immutable desired state
+    /// before writing, retaining only `status` from this request.
+    pub fn validate_status_update(&self, previous: &Self) -> Result<(), ApiError> {
+        validate_dns_subdomain("metadata.name", self.name()?, 253)?;
+        validate_dns_label("metadata.namespace", self.namespace()?)?;
+        if self.name()? != previous.name()? || self.namespace()? != previous.namespace()? {
+            return Err(ApiError::Invalid {
+                message: "Pod identity is immutable after creation".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Retains only the requested status and advances the shared Pod resourceVersion.
+    pub fn preserve_status_update_from(&mut self, previous: &Self, resource_version: String) {
+        let status = self.status.clone();
+        self.type_meta = previous.type_meta.clone();
+        self.metadata = previous.metadata.clone();
+        self.metadata.resource_version = Some(resource_version);
+        self.spec = previous.spec.clone();
+        self.status = status;
+    }
 }
 
 /// Minimal self-registration desired state retained before full Node API support.

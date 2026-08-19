@@ -156,7 +156,12 @@ impl ApiRegistry {
                     kind: "Pod",
                     scope: ResourceScope::Namespaced,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[],
+                    subresources: &[SubresourceStrategy {
+                        name: "status",
+                        discovery_name: "pods/status",
+                        kind: "Pod",
+                        verbs: &["get", "update"],
+                    }],
                 },
                 ResourceStrategy {
                     plural: "serviceaccounts",
@@ -352,7 +357,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 7);
+        assert_eq!(discovery.resources.len(), 8);
         assert!(discovery
             .resources
             .iter()
@@ -412,6 +417,20 @@ mod tests {
             .expect("namespaced Pod collection resolves");
         assert_eq!(pod_collection.resource.kind, "Pod");
         assert_eq!(pod_collection.namespace.as_deref(), Some("development"));
+
+        let pod_status = registry
+            .resolve_core_v1_path("/api/v1/namespaces/development/pods/web/status")
+            .expect("namespaced Pod status subresource resolves");
+        assert_eq!(pod_status.resource.kind, "Pod");
+        assert_eq!(pod_status.namespace.as_deref(), Some("development"));
+        assert_eq!(pod_status.name.as_deref(), Some("web"));
+        assert_eq!(pod_status.subresource, Some("status"));
+        assert!(discovery.resources.iter().any(|resource| {
+            resource.name == "pods/status"
+                && resource.namespaced
+                && resource.kind == "Pod"
+                && resource.verbs == ["get", "update"]
+        }));
 
         let service_account = registry
             .resolve_core_v1_path("/api/v1/namespaces/development/serviceaccounts/build-robot")

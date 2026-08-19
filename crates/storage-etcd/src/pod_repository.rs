@@ -282,6 +282,56 @@ impl EtcdPodRepository {
         Ok(resource)
     }
 
+    /// Replaces only the status projection of a Pod through an atomic etcd mod-revision compare.
+    pub async fn update_status(&self, mut resource: Pod) -> Result<Pod, ApiError> {
+        resource.enforce_type_meta()?;
+        let namespace = resource.namespace()?.to_owned();
+        let name = resource.name()?.to_owned();
+        let reference = ResourceReference::pod(namespace.clone(), name.clone());
+        let requested_version = resource.metadata.resource_version.clone();
+        let stored = self.get_stored(&namespace, &name).await?;
+
+        if let Some(requested_version) = requested_version {
+            if requested_version
+                != stored
+                    .resource
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default()
+            {
+                return Err(ApiError::Conflict {
+                    resource: reference,
+                });
+            }
+        }
+        resource.validate_status_update(&stored.resource)?;
+        resource.preserve_status_update_from(&stored.resource, "0".to_owned());
+        let encoded = encode(&resource)?;
+        let key = self.pod_key(&namespace, &name)?;
+        let transaction = Txn::new()
+            .when(vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                stored.mod_revision,
+            )])
+            .and_then(vec![TxnOp::put(key, encoded, None)]);
+        let response = self
+            .client
+            .lock()
+            .await
+            .txn(transaction)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        if !response.succeeded() {
+            return Err(ApiError::Conflict {
+                resource: reference,
+            });
+        }
+        resource.metadata.resource_version = Some(response_revision(&response)?);
+        Ok(resource)
+    }
+
     /// Atomically applies the scheduler's one-time node assignment to an unscheduled Pod.
     pub async fn bind(
         &self,

@@ -261,6 +261,38 @@ impl InMemoryPodStore {
         Ok(resource)
     }
 
+    /// Updates only the status projection of an existing Pod under its shared resourceVersion.
+    pub async fn update_status(&self, mut resource: Pod) -> Result<Pod, ApiError> {
+        self.drain_closed_watchers().await;
+        resource.enforce_type_meta()?;
+        let key = PodKey::from_resource(&resource)?;
+        let mut state = self.state.write().await;
+        let previous = state
+            .pods
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: key.reference(),
+            })?;
+        verify_update_version(
+            resource.metadata.resource_version.as_deref(),
+            previous.metadata.resource_version.as_deref(),
+            &key.reference(),
+        )?;
+        resource.validate_status_update(&previous)?;
+        let resource_version = state.next_resource_version();
+        resource.preserve_status_update_from(&previous, resource_version);
+        let event = PodWatchEvent::modified(resource.clone());
+        state.pods.insert(key, resource.clone());
+        let revision = state.revision;
+        state.publish(PodHistoryEvent {
+            revision,
+            resource: resource.clone(),
+            event,
+        });
+        Ok(resource)
+    }
+
     /// Atomically assigns an unscheduled Pod to a node after checking the scheduler snapshot's
     /// resourceVersion. Competing schedulers receive Conflict and no assignment is overwritten.
     pub async fn bind(
@@ -784,8 +816,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use rusternetes_api_types::{
-        Container, NamespacePhase, NamespaceStatus, ObjectMeta, PodPhase, PodSpec, TypeMeta,
-        WatchEventType,
+        Container, NamespacePhase, NamespaceStatus, ObjectMeta, PodPhase, PodSpec, PodWatchObject,
+        TypeMeta, WatchEventType,
     };
 
     use super::*;
@@ -846,6 +878,47 @@ mod tests {
             watch.recv().await.expect("delete").event_type,
             WatchEventType::Deleted
         );
+    }
+
+    #[tokio::test]
+    async fn pod_status_update_isolated_cas_guarded_and_watched() {
+        let store = InMemoryPodStore::new();
+        let created = store.create(pod("web")).await.expect("Pod creates");
+        let mut watch = store
+            .watch(PodWatchRequest {
+                namespace: Some("default".to_owned()),
+                resource_version: created.metadata.resource_version.clone(),
+                ..PodWatchRequest::default()
+            })
+            .await
+            .expect("watch starts");
+        let mut status_update = created.clone();
+        status_update.spec.node_name = Some("attempted-spec-mutation".to_owned());
+        status_update.status.phase = Some(PodPhase::Running);
+        let updated = store
+            .update_status(status_update)
+            .await
+            .expect("status update succeeds");
+        assert_eq!(updated.status.phase, Some(PodPhase::Running));
+        assert_eq!(updated.spec, created.spec);
+        assert_ne!(
+            updated.metadata.resource_version,
+            created.metadata.resource_version
+        );
+        let event = watch.recv().await.expect("status update reaches watch");
+        assert_eq!(event.event_type, WatchEventType::Modified);
+        let PodWatchObject::Pod(event_pod) = event.object else {
+            panic!("modified Pod watch event must carry a Pod");
+        };
+        assert_eq!(event_pod.status.phase, Some(PodPhase::Running));
+
+        let mut stale = updated.clone();
+        stale.metadata.resource_version = created.metadata.resource_version;
+        stale.status.phase = Some(PodPhase::Failed);
+        assert!(matches!(
+            store.update_status(stale).await,
+            Err(ApiError::Conflict { .. })
+        ));
     }
 
     #[tokio::test]

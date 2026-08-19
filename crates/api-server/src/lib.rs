@@ -209,6 +209,13 @@ impl PodBackend {
         }
     }
 
+    async fn update_status(&self, resource: Pod) -> Result<Pod, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update_status(resource).await,
+            Self::Etcd(repository) => repository.update_status(resource).await,
+        }
+    }
+
     async fn delete(
         &self,
         namespace: &str,
@@ -744,6 +751,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route(
             "/api/v1/namespaces/:namespace/pods/:name",
             get(get_pod).put(replace_pod).delete(delete_pod),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/pods/:name/status",
+            get(get_pod_status).put(replace_pod_status),
         )
         .route(
             "/api/v1/namespaces/:namespace/serviceaccounts",
@@ -1586,6 +1597,22 @@ async fn replace_pod(
     Ok(Json(state.backend.pods.update(resource).await?))
 }
 
+async fn get_pod_status(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> ApiResult<Json<Pod>> {
+    Ok(Json(state.backend.pods.get(&namespace, &name).await?))
+}
+
+async fn replace_pod_status(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<Pod>> {
+    let resource = bind_pod_status_update_identity(decode_pod(body)?, &namespace, &name)?;
+    Ok(Json(state.backend.pods.update_status(resource).await?))
+}
+
 async fn delete_pod(
     State(state): State<AppState>,
     Extension(identity): Extension<RequestIdentity>,
@@ -2275,6 +2302,21 @@ fn bind_pod_update_identity(resource: Pod, namespace: &str, name: &str) -> ApiRe
     }
 }
 
+/// Ensures a status replacement cannot target a different Pod than its URI declares.
+fn bind_pod_status_update_identity(resource: Pod, namespace: &str, name: &str) -> ApiResult<Pod> {
+    bind_pod_update_identity(resource, namespace, name).map_err(|error| match error.0 {
+        ApiError::Invalid { message }
+            if message == "metadata.name is required for a replace request" =>
+        {
+            ApiError::Invalid {
+                message: "metadata.name is required for a status replace request".to_owned(),
+            }
+            .into()
+        }
+        error => ApiRejection(error),
+    })
+}
+
 fn bind_node_update_identity(resource: Node, name: &str) -> ApiResult<Node> {
     match resource.metadata.name.as_deref() {
         Some(body_name) if body_name == name => Ok(resource),
@@ -2596,6 +2638,98 @@ mod tests {
             .await
             .expect("router is infallible");
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn pod_status_subresource_isolated_and_resource_version_guarded() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/pods")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&Pod {
+                            type_meta: TypeMeta::pod(),
+                            metadata: ObjectMeta {
+                                name: Some("status-web".to_owned()),
+                                ..ObjectMeta::default()
+                            },
+                            spec: PodSpec {
+                                containers: vec![Container {
+                                    name: "app".to_owned(),
+                                    image: Some("example:v1".to_owned()),
+                                    ..Container::default()
+                                }],
+                                ..PodSpec::default()
+                            },
+                            ..Pod::default()
+                        })
+                        .expect("Pod serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created: Pod = serde_json::from_slice(
+            &to_bytes(create.into_body(), usize::MAX)
+                .await
+                .expect("create body is readable"),
+        )
+        .expect("created Pod is JSON");
+        let mut status_update = created.clone();
+        status_update.spec.node_name = Some("forbidden-spec-change".to_owned());
+        status_update.status.phase = Some(rusternetes_api_types::PodPhase::Running);
+        let updated_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/default/pods/status-web/status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&status_update).expect("status Pod serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(updated_response.status(), StatusCode::OK);
+        let updated: Pod = serde_json::from_slice(
+            &to_bytes(updated_response.into_body(), usize::MAX)
+                .await
+                .expect("status body is readable"),
+        )
+        .expect("status Pod is JSON");
+        assert_eq!(
+            updated.status.phase,
+            Some(rusternetes_api_types::PodPhase::Running)
+        );
+        assert_eq!(updated.spec, created.spec);
+        assert_ne!(
+            updated.metadata.resource_version,
+            created.metadata.resource_version
+        );
+
+        let mut stale = created;
+        stale.status.phase = Some(rusternetes_api_types::PodPhase::Failed);
+        let stale_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/default/pods/status-web/status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&stale).expect("stale Pod serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

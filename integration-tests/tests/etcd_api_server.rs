@@ -848,6 +848,61 @@ async fn http_core_backend_persists_pods_in_real_etcd_without_memory_fallback() 
 }
 
 #[tokio::test]
+async fn pod_status_persists_through_configured_etcd_backend_without_spec_mutation() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let root = format!("/rusternetes-pod-status-http-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&root))
+        .await
+        .expect("durable core backend initializes");
+    let repository = EtcdPodRepository::connect([endpoint.as_str()], Some(&format!("{root}/pods")))
+        .await
+        .expect("direct Pod etcd repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let created_response = client
+        .post(format!(
+            "{}/api/v1/namespaces/default/pods",
+            server.base_url
+        ))
+        .json(&pod("status-web", "default"))
+        .send()
+        .await
+        .expect("Pod create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Pod = created_response.json().await.expect("typed Pod response");
+
+    let mut status_update = created.clone();
+    status_update.spec.node_name = Some("attempted-spec-mutation".to_owned());
+    status_update.status.phase = Some(PodPhase::Running);
+    let updated_response = client
+        .put(format!(
+            "{}/api/v1/namespaces/default/pods/status-web/status",
+            server.base_url
+        ))
+        .json(&status_update)
+        .send()
+        .await
+        .expect("Pod status update completes");
+    assert_eq!(updated_response.status(), reqwest::StatusCode::OK);
+    let updated: Pod = updated_response
+        .json()
+        .await
+        .expect("typed status response");
+    assert_eq!(updated.status.phase, Some(PodPhase::Running));
+    assert_eq!(updated.spec, created.spec);
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let persisted = repository
+        .get("default", "status-web")
+        .await
+        .expect("status update is durable in real etcd");
+    assert_eq!(persisted, updated);
+}
+
+#[tokio::test]
 async fn service_account_api_persists_through_configured_etcd_backend() {
     let (_etcd, endpoint) = start_etcd().await;
     let prefix = format!("/rusternetes-http-serviceaccounts/{}", Uuid::new_v4());
