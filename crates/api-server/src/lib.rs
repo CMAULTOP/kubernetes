@@ -12,10 +12,8 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rusternetes_api_types::{
-    core_api_versions, core_v1_resources, ApiStatus, ConfigMap, DeleteOptions, FieldSelector,
-    LabelSelector,
-};
+use rusternetes_api_registry::ApiRegistry;
+use rusternetes_api_types::{ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector};
 use rusternetes_authn::{AuthenticationChain, RequestIdentity};
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
@@ -128,11 +126,29 @@ impl ConfigMapBackend {
 #[derive(Clone)]
 pub struct AppState {
     backend: ConfigMapBackend,
+    registry: ApiRegistry,
+    authorization: AuthorizationMode,
 }
 
 impl AppState {
     pub fn new(backend: ConfigMapBackend) -> Self {
-        Self { backend }
+        Self::with_registry_and_authorization(
+            backend,
+            ApiRegistry::core_v1(),
+            AuthorizationMode::default(),
+        )
+    }
+
+    pub fn with_registry_and_authorization(
+        backend: ConfigMapBackend,
+        registry: ApiRegistry,
+        authorization: AuthorizationMode,
+    ) -> Self {
+        Self {
+            backend,
+            registry,
+            authorization,
+        }
     }
 }
 
@@ -181,7 +197,8 @@ pub fn router_with_backend_auth_and_authorization(
     authentication: AuthenticationChain,
     authorization: AuthorizationMode,
 ) -> Router {
-    let state = AppState::new(backend);
+    let state =
+        AppState::with_registry_and_authorization(backend, ApiRegistry::core_v1(), authorization);
     Router::new()
         .route("/version", get(version))
         .route("/api", get(api_versions))
@@ -201,7 +218,7 @@ pub fn router_with_backend_auth_and_authorization(
         // Axum applies the last layer first. Authentication must populate extensions before RBAC
         // evaluates them, so authorization is added before authentication here.
         .layer(middleware::from_fn_with_state(
-            authorization,
+            state.clone(),
             authorize_request,
         ))
         .layer(middleware::from_fn_with_state(
@@ -269,11 +286,11 @@ async fn authenticate_request(
 }
 
 async fn authorize_request(
-    State(authorization): State<AuthorizationMode>,
+    State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    match authorization {
+    match &state.authorization {
         AuthorizationMode::AlwaysAllow => next.run(request).await,
         AuthorizationMode::Rbac(authorizer) => {
             let Some(identity) = request.extensions().get::<RequestIdentity>() else {
@@ -283,7 +300,8 @@ async fn authorize_request(
                 })
                 .into_response();
             };
-            let attributes = authorization_request_from_http(request.method(), request.uri());
+            let attributes =
+                authorization_request_from_http(&state.registry, request.method(), request.uri());
             if authorizer.authorize(identity, &attributes) {
                 next.run(request).await
             } else {
@@ -297,41 +315,18 @@ async fn authorize_request(
 }
 
 fn authorization_request_from_http(
+    registry: &ApiRegistry,
     method: &axum::http::Method,
     uri: &axum::http::Uri,
 ) -> AuthorizationRequest {
-    let segments = uri
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    match segments.as_slice() {
-        ["api", "v1", "configmaps"] => config_map_request(method, uri.query(), None, None),
-        ["api", "v1", "namespaces", namespace, "configmaps"] => {
-            config_map_request(method, uri.query(), Some((*namespace).to_owned()), None)
-        }
-        ["api", "v1", "namespaces", namespace, "configmaps", name] => config_map_request(
-            method,
-            uri.query(),
-            Some((*namespace).to_owned()),
-            Some((*name).to_owned()),
-        ),
-        _ => AuthorizationRequest::non_resource(
+    let Some(resolved) = registry.resolve_core_v1_path(uri.path()) else {
+        return AuthorizationRequest::non_resource(
             method.as_str().to_ascii_lowercase(),
             uri.path().to_owned(),
-        ),
-    }
-}
-
-fn config_map_request(
-    method: &axum::http::Method,
-    query: Option<&str>,
-    namespace: Option<String>,
-    name: Option<String>,
-) -> AuthorizationRequest {
-    let collection = name.is_none();
-    let watch = query.is_some_and(|query| {
+        );
+    };
+    let collection = resolved.name.is_none();
+    let watch = uri.query().is_some_and(|query| {
         query
             .split('&')
             .any(|item| matches!(item, "watch=true" | "watch=1"))
@@ -347,7 +342,14 @@ fn config_map_request(
         "GET" | "HEAD" => "get",
         other => other,
     };
-    AuthorizationRequest::resource(verb, "", "configmaps", None, namespace, name)
+    AuthorizationRequest::resource(
+        verb,
+        resolved.group,
+        resolved.resource.plural,
+        None,
+        resolved.namespace,
+        resolved.name,
+    )
 }
 
 /// A local response wrapper makes the API error representation available to Axum without
@@ -413,12 +415,20 @@ async fn version() -> Json<VersionInfo> {
     })
 }
 
-async fn api_versions() -> Json<rusternetes_api_types::ApiVersions> {
-    Json(core_api_versions())
+async fn api_versions(State(state): State<AppState>) -> Json<rusternetes_api_types::ApiVersions> {
+    Json(state.registry.core_api_versions())
 }
 
-async fn core_v1_api_resources() -> Json<rusternetes_api_types::ApiResourceList> {
-    Json(core_v1_resources())
+async fn core_v1_api_resources(
+    State(state): State<AppState>,
+) -> Json<rusternetes_api_types::ApiResourceList> {
+    // The route itself exists only because core/v1 is registered by the built-in strategy.
+    Json(
+        state
+            .registry
+            .discovery("", "v1")
+            .expect("core/v1 API route requires a registered core/v1 strategy"),
+    )
 }
 
 async fn list_all_config_maps(
@@ -675,6 +685,38 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn core_v1_discovery_is_derived_from_the_registered_strategy() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1")
+                    .body(Body::empty())
+                    .expect("valid discovery request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("discovery response body is readable");
+        let discovery: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response is APIResourceList JSON");
+        let config_maps = discovery["resources"]
+            .as_array()
+            .expect("discovery resources are an array")
+            .iter()
+            .find(|resource| resource["name"] == "configmaps")
+            .expect("ConfigMap strategy is discoverable");
+        assert_eq!(config_maps["namespaced"], true);
+        assert!(config_maps["verbs"]
+            .as_array()
+            .expect("ConfigMap verbs are an array")
+            .iter()
+            .any(|verb| verb == "watch"));
+    }
 
     #[tokio::test]
     async fn missing_namespace_is_bound_from_the_resource_path() {

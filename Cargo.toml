@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/authn",
     "crates/authz-rbac",
+    "crates/api-registry",
     "crates/api-types",
     "crates/storage",
     "crates/storage-etcd",

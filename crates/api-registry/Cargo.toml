@@ -1,0 +1,10 @@
+[package]
+name = "rusternetes-api-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusternetes-api-types = { path = "../api-types" }

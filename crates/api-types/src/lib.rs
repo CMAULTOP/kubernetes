@@ -601,30 +601,6 @@ pub struct ApiResourceList {
     pub resources: Vec<ApiResource>,
 }
 
-pub fn core_api_versions() -> ApiVersions {
-    ApiVersions {
-        kind: "APIVersions",
-        api_version: "v1",
-        versions: vec![CORE_API_VERSION],
-        server_address_by_client_cidrs: Vec::new(),
-    }
-}
-
-pub fn core_v1_resources() -> ApiResourceList {
-    ApiResourceList {
-        kind: "APIResourceList",
-        api_version: "v1",
-        group_version: "v1",
-        resources: vec![ApiResource {
-            name: "configmaps",
-            singular_name: "configmap",
-            namespaced: true,
-            kind: CONFIG_MAP_KIND,
-            verbs: vec!["create", "delete", "get", "list", "update"],
-        }],
-    }
-}
-
 fn validate_config_map_key(field: &str, key: &str) -> Result<(), ApiError> {
     if key.is_empty() || key.len() > 253 {
         return Err(ApiError::Invalid {

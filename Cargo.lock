@@ -880,12 +880,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
+name = "rusternetes-api-registry"
+version = "0.1.0"
+dependencies = [
+ "rusternetes-api-types",
+]
+
+[[package]]
 name = "rusternetes-api-server"
 version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum 0.7.9",
  "http",
+ "rusternetes-api-registry",
  "rusternetes-api-types",
  "rusternetes-authn",
  "rusternetes-authz-rbac",
