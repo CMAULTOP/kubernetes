@@ -263,6 +263,55 @@ impl EtcdNamespaceRepository {
         Ok(resource)
     }
 
+    /// Replaces only the status projection of a Namespace through an atomic etcd mod-revision compare.
+    pub async fn update_status(&self, mut resource: Namespace) -> Result<Namespace, ApiError> {
+        resource.enforce_type_meta()?;
+        let name = resource.name()?.to_owned();
+        let reference = ResourceReference::namespace(name.clone());
+        let requested_version = resource.metadata.resource_version.clone();
+        let stored = self.get_stored(&name).await?;
+
+        if let Some(requested_version) = requested_version {
+            if requested_version
+                != stored
+                    .resource
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or_default()
+            {
+                return Err(ApiError::Conflict {
+                    resource: reference,
+                });
+            }
+        }
+        resource.validate_status_update(&stored.resource)?;
+        resource.preserve_status_update_from(&stored.resource, "0".to_owned());
+        let encoded = encode(&resource)?;
+        let key = self.namespace_key(&name)?;
+        let transaction = Txn::new()
+            .when(vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                stored.mod_revision,
+            )])
+            .and_then(vec![TxnOp::put(key, encoded, None)]);
+        let response = self
+            .client
+            .lock()
+            .await
+            .txn(transaction)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        if !response.succeeded() {
+            return Err(ApiError::Conflict {
+                resource: reference,
+            });
+        }
+        resource.metadata.resource_version = Some(response_revision(&response)?);
+        Ok(resource)
+    }
+
     pub async fn delete(
         &self,
         name: &str,

@@ -26,7 +26,8 @@ use rusternetes_authz_rbac::{
 };
 use rusternetes_common::StatusReason;
 use rusternetes_storage_etcd::{
-    EtcdConfigMapRepository, EtcdNodeRepository, EtcdPodRepository, EtcdServiceAccountRepository,
+    EtcdConfigMapRepository, EtcdNamespaceRepository, EtcdNodeRepository, EtcdPodRepository,
+    EtcdServiceAccountRepository,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
@@ -845,6 +846,70 @@ async fn http_core_backend_persists_pods_in_real_etcd_without_memory_fallback() 
         .unwrap_or_else(|error| panic!("Pod is durable in real etcd: {error}"));
     assert_eq!(persisted.metadata.name.as_deref(), Some("web"));
     assert_eq!(persisted.status.phase, Some(PodPhase::Pending));
+}
+
+#[tokio::test]
+async fn namespace_status_persists_through_configured_etcd_backend_without_spec_mutation() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let root = format!(
+        "/rusternetes-namespace-status-http-tests/{}",
+        Uuid::new_v4()
+    );
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&root))
+        .await
+        .expect("durable core backend initializes");
+    let repository =
+        EtcdNamespaceRepository::connect([endpoint.as_str()], Some(&format!("{root}/namespaces")))
+            .await
+            .expect("direct Namespace etcd repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let created_response = client
+        .post(format!("{}/api/v1/namespaces", server.base_url))
+        .json(&namespace("status-development"))
+        .send()
+        .await
+        .expect("Namespace create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: Namespace = created_response
+        .json()
+        .await
+        .expect("typed Namespace response");
+
+    let mut status_update = created.clone();
+    status_update
+        .spec
+        .finalizers
+        .push("attempted-finalizer".to_owned());
+    status_update.status.phase = Some(rusternetes_api_types::NamespacePhase::Terminating);
+    let updated_response = client
+        .put(format!(
+            "{}/api/v1/namespaces/status-development/status",
+            server.base_url
+        ))
+        .json(&status_update)
+        .send()
+        .await
+        .expect("Namespace status update completes");
+    assert_eq!(updated_response.status(), reqwest::StatusCode::OK);
+    let updated: Namespace = updated_response
+        .json()
+        .await
+        .expect("typed status response");
+    assert_eq!(
+        updated.status.phase,
+        Some(rusternetes_api_types::NamespacePhase::Terminating)
+    );
+    assert_eq!(updated.spec, created.spec);
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+    let persisted = repository
+        .get("status-development")
+        .await
+        .expect("status update is durable in real etcd");
+    assert_eq!(persisted, updated);
 }
 
 #[tokio::test]

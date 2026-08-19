@@ -197,7 +197,12 @@ impl ApiRegistry {
                     kind: "Namespace",
                     scope: ResourceScope::Cluster,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[],
+                    subresources: &[SubresourceStrategy {
+                        name: "status",
+                        discovery_name: "namespaces/status",
+                        kind: "Namespace",
+                        verbs: &["get", "update"],
+                    }],
                 },
             ],
         }])
@@ -357,7 +362,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 8);
+        assert_eq!(discovery.resources.len(), 9);
         assert!(discovery
             .resources
             .iter()

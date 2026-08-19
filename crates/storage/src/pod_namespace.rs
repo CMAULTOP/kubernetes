@@ -650,6 +650,40 @@ impl InMemoryNamespaceStore {
         Ok(resource)
     }
 
+    /// Updates only the status projection of an existing Namespace under its shared resourceVersion.
+    pub async fn update_status(&self, mut resource: Namespace) -> Result<Namespace, ApiError> {
+        self.drain_closed_watchers().await;
+        resource.enforce_type_meta()?;
+        let name = resource.name()?.to_owned();
+        let reference = ResourceReference::namespace(name.clone());
+        let requested_version = resource.metadata.resource_version.clone();
+        let mut state = self.state.write().await;
+        let previous = state
+            .namespaces
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: reference.clone(),
+            })?;
+        verify_update_version(
+            requested_version.as_deref(),
+            previous.metadata.resource_version.as_deref(),
+            &reference,
+        )?;
+        resource.validate_status_update(&previous)?;
+        let resource_version = state.next_resource_version();
+        resource.preserve_status_update_from(&previous, resource_version);
+        let event = NamespaceWatchEvent::modified(resource.clone());
+        state.namespaces.insert(name, resource.clone());
+        let revision = state.revision;
+        state.publish(NamespaceHistoryEvent {
+            revision,
+            resource: resource.clone(),
+            event,
+        });
+        Ok(resource)
+    }
+
     pub async fn delete(
         &self,
         name: &str,

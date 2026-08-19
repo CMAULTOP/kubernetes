@@ -389,6 +389,13 @@ impl NamespaceBackend {
         }
     }
 
+    async fn update_status(&self, resource: Namespace) -> Result<Namespace, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update_status(resource).await,
+            Self::Etcd(repository) => repository.update_status(resource).await,
+        }
+    }
+
     async fn delete(&self, name: &str, options: DeleteOptions) -> Result<DeleteResult, ApiError> {
         match self {
             Self::InMemory(store) => store.delete(name, options).await,
@@ -733,6 +740,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             get(get_namespace)
                 .put(replace_namespace)
                 .delete(delete_namespace),
+        )
+        .route(
+            "/api/v1/namespaces/:name/status",
+            get(get_namespace_status).put(replace_namespace_status),
         )
         .route(
             "/api/v1/namespaces/:namespace/configmaps",
@@ -1687,6 +1698,24 @@ async fn replace_namespace(
     Ok(Json(state.backend.namespaces.update(resource).await?))
 }
 
+async fn get_namespace_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Namespace>> {
+    Ok(Json(state.backend.namespaces.get(&name).await?))
+}
+
+async fn replace_namespace_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Namespace>> {
+    let resource = bind_namespace_status_update_identity(decode_namespace(body)?, &name)?;
+    Ok(Json(
+        state.backend.namespaces.update_status(resource).await?,
+    ))
+}
+
 async fn delete_namespace(
     State(state): State<AppState>,
     Extension(identity): Extension<RequestIdentity>,
@@ -2346,6 +2375,21 @@ fn bind_node_status_update_identity(resource: Node, name: &str) -> ApiResult<Nod
     })
 }
 
+/// Ensures a status replacement cannot target a different Namespace than its URI declares.
+fn bind_namespace_status_update_identity(resource: Namespace, name: &str) -> ApiResult<Namespace> {
+    bind_namespace_update_identity(resource, name).map_err(|error| match error.0 {
+        ApiError::Invalid { message }
+            if message == "metadata.name is required for a replace request" =>
+        {
+            ApiError::Invalid {
+                message: "metadata.name is required for a status replace request".to_owned(),
+            }
+            .into()
+        }
+        error => ApiRejection(error),
+    })
+}
+
 fn bind_namespace_update_identity(resource: Namespace, name: &str) -> ApiResult<Namespace> {
     match resource.metadata.name.as_deref() {
         Some(body_name) if body_name == name => Ok(resource),
@@ -2724,6 +2768,93 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&stale).expect("stale Pod serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn namespace_status_subresource_isolated_and_resource_version_guarded() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&Namespace {
+                            type_meta: TypeMeta::namespace(),
+                            metadata: ObjectMeta {
+                                name: Some("status-development".to_owned()),
+                                ..ObjectMeta::default()
+                            },
+                            ..Namespace::default()
+                        })
+                        .expect("Namespace serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created: Namespace = serde_json::from_slice(
+            &to_bytes(create.into_body(), usize::MAX)
+                .await
+                .expect("create body is readable"),
+        )
+        .expect("created Namespace is JSON");
+        let mut status_update = created.clone();
+        status_update
+            .spec
+            .finalizers
+            .push("forbidden-finalizer".to_owned());
+        status_update.status.phase = Some(rusternetes_api_types::NamespacePhase::Terminating);
+        let updated_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/status-development/status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&status_update).expect("status Namespace serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(updated_response.status(), StatusCode::OK);
+        let updated: Namespace = serde_json::from_slice(
+            &to_bytes(updated_response.into_body(), usize::MAX)
+                .await
+                .expect("status body is readable"),
+        )
+        .expect("status Namespace is JSON");
+        assert_eq!(
+            updated.status.phase,
+            Some(rusternetes_api_types::NamespacePhase::Terminating)
+        );
+        assert_eq!(updated.spec, created.spec);
+        assert_ne!(
+            updated.metadata.resource_version,
+            created.metadata.resource_version
+        );
+
+        let mut stale = created;
+        stale.status.phase = Some(rusternetes_api_types::NamespacePhase::Terminating);
+        let stale_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/status-development/status")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&stale).expect("stale Namespace serializes"),
                     ))
                     .expect("valid request"),
             )

@@ -1025,6 +1025,33 @@ impl Namespace {
         );
         self.status = previous.status.clone();
     }
+
+    /// Validates immutable identity fields submitted to the dedicated `/status` endpoint.
+    pub fn validate_status_update(&self, previous: &Self) -> Result<(), ApiError> {
+        validate_dns_label("metadata.name", self.name()?)?;
+        if self.metadata.namespace.is_some() {
+            return Err(ApiError::Invalid {
+                message: "Namespace is cluster-scoped and must not set metadata.namespace"
+                    .to_owned(),
+            });
+        }
+        if self.name()? != previous.name()? {
+            return Err(ApiError::Invalid {
+                message: "Namespace identity is immutable after creation".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Retains only the requested status and advances the shared Namespace resourceVersion.
+    pub fn preserve_status_update_from(&mut self, previous: &Self, resource_version: String) {
+        let status = self.status.clone();
+        self.type_meta = previous.type_meta.clone();
+        self.metadata = previous.metadata.clone();
+        self.metadata.resource_version = Some(resource_version);
+        self.spec = previous.spec.clone();
+        self.status = status;
+    }
 }
 
 /// A typed Pod list response.
