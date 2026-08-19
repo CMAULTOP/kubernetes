@@ -28,13 +28,14 @@ use rusternetes_storage::{
     ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
     DeleteResult, InMemoryConfigMapStore, InMemoryNamespaceStore, InMemoryNodeStore,
     InMemoryPodStore, NamespaceWatchRequest,
-    NamespaceWatchSubscription as InMemoryNamespaceWatchSubscription, PodWatchRequest,
+    NamespaceWatchSubscription as InMemoryNamespaceWatchSubscription, NodeWatchRequest,
+    NodeWatchSubscription as InMemoryNodeWatchSubscription, PodWatchRequest,
     PodWatchSubscription as InMemoryPodWatchSubscription,
 };
 use rusternetes_storage_etcd::{
     EtcdConfigMapRepository, EtcdConfigMapWatchSubscription, EtcdNamespaceRepository,
-    EtcdNamespaceWatchSubscription, EtcdNodeRepository, EtcdPodRepository,
-    EtcdPodWatchSubscription,
+    EtcdNamespaceWatchSubscription, EtcdNodeRepository, EtcdNodeWatchSubscription,
+    EtcdPodRepository, EtcdPodWatchSubscription,
 };
 use serde::{Deserialize, Serialize};
 
@@ -311,6 +312,20 @@ pub enum NodeBackend {
     Etcd(Arc<EtcdNodeRepository>),
 }
 
+pub enum NodeWatchSubscription {
+    InMemory(InMemoryNodeWatchSubscription),
+    Etcd(EtcdNodeWatchSubscription),
+}
+
+impl NodeWatchSubscription {
+    async fn recv(&mut self) -> Option<rusternetes_api_types::NodeWatchEvent> {
+        match self {
+            Self::InMemory(subscription) => subscription.recv().await,
+            Self::Etcd(subscription) => subscription.recv().await,
+        }
+    }
+}
+
 impl NodeBackend {
     async fn create(&self, resource: Node) -> Result<Node, ApiError> {
         match self {
@@ -348,6 +363,19 @@ impl NodeBackend {
         match self {
             Self::InMemory(store) => store.delete(name, options).await,
             Self::Etcd(repository) => repository.delete(name, options).await,
+        }
+    }
+
+    async fn watch(&self, request: NodeWatchRequest) -> Result<NodeWatchSubscription, ApiError> {
+        match self {
+            Self::InMemory(store) => store
+                .watch(request)
+                .await
+                .map(NodeWatchSubscription::InMemory),
+            Self::Etcd(repository) => repository
+                .watch(request)
+                .await
+                .map(NodeWatchSubscription::Etcd),
         }
     }
 }
@@ -1144,10 +1172,7 @@ async fn list_nodes(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
-        return Err(ApiError::BadRequest {
-            message: "Node WATCH is not exposed until the in-memory and etcd watch implementations have identical runtime coverage".to_owned(),
-        }
-        .into());
+        return open_node_watch(&state, &query).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
@@ -1262,6 +1287,25 @@ async fn open_pod_watch(
     Ok(pod_watch_response(subscription))
 }
 
+async fn open_node_watch(state: &AppState, query: &ListQuery) -> ApiResult<Response> {
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    let subscription = state
+        .backend
+        .nodes
+        .watch(NodeWatchRequest {
+            label_selector,
+            field_selector,
+            resource_version: query.resource_version.clone(),
+            allow_bookmarks: parse_boolean(
+                query.allow_watch_bookmarks.as_deref(),
+                "allowWatchBookmarks",
+            )?,
+        })
+        .await?;
+    Ok(node_watch_response(subscription))
+}
+
 async fn open_namespace_watch(state: &AppState, query: &ListQuery) -> ApiResult<Response> {
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
@@ -1316,6 +1360,29 @@ fn reject_list_resource_version(query: &ListQuery) -> ApiResult<()> {
         .into());
     }
     Ok(())
+}
+
+fn node_watch_response(subscription: NodeWatchSubscription) -> Response {
+    let event_stream = stream! {
+        let mut subscription = subscription;
+        while let Some(event) = subscription.recv().await {
+            let mut encoded = match serde_json::to_vec(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    yield Err::<Bytes, io::Error>(io::Error::other(error));
+                    break;
+                }
+            };
+            encoded.push(b'\n');
+            yield Ok::<Bytes, io::Error>(Bytes::from(encoded));
+        }
+    };
+    let mut response = Response::new(Body::from_stream(event_stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json;stream=watch"),
+    );
+    response
 }
 
 fn watch_response(subscription: ConfigMapWatchSubscription) -> Response {

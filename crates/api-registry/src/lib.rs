@@ -148,7 +148,7 @@ impl ApiRegistry {
                     singular: "node",
                     kind: "Node",
                     scope: ResourceScope::Cluster,
-                    verbs: &["create", "delete", "get", "list", "update"],
+                    verbs: &["create", "delete", "get", "list", "update", "watch"],
                 },
                 ResourceStrategy {
                     plural: "namespaces",

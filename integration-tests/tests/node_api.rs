@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use rusternetes_api_server::{core_backend_from_etcd_config, router_with_core_backend};
 use rusternetes_api_types::{ApiStatus, Node, NodeList, NodeSpec, ObjectMeta, TypeMeta};
 use rusternetes_common::StatusReason;
@@ -54,6 +55,36 @@ async fn status(response: reqwest::Response) -> ApiStatus {
         .json()
         .await
         .unwrap_or_else(|error| panic!("Status JSON expected: {error}"))
+}
+
+#[tokio::test]
+async fn node_watch_replays_typed_creation_event_over_http() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/nodes", server.base_url);
+    let created_response = client
+        .post(&collection)
+        .json(&node("node-a"))
+        .send()
+        .await
+        .expect("create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+
+    let response = client
+        .get(format!("{collection}?watch=true&resourceVersion=0"))
+        .send()
+        .await
+        .expect("watch opens");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let first = stream
+        .next()
+        .await
+        .expect("watch delivers one event")
+        .expect("watch payload is valid");
+    let event: serde_json::Value = serde_json::from_slice(&first).expect("watch event is JSON");
+    assert_eq!(event["type"], "ADDED");
+    assert_eq!(event["object"]["metadata"]["name"], "node-a");
 }
 
 #[tokio::test]
