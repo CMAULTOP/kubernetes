@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-stream.workspace = true
 axum.workspace = true
+base64.workspace = true
 http.workspace = true
 json-patch.workspace = true
 rusternetes-api-types = { path = "../api-types" }
@@ -23,6 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

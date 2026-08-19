@@ -1,5 +1,7 @@
 //! Axum HTTP API server for the first Rusternetes vertical slice.
 
+mod pagination;
+
 use std::{io, sync::Arc};
 
 use async_stream::stream;
@@ -12,14 +14,16 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
+use pagination::{ListPaginationRequest, ListResource, PaginationCache, SnapshotItems};
 use rusternetes_admission::{
     AdmissionChain, AdmissionRequest, NamespaceLifecyclePlugin,
     NamespacePhase as AdmissionNamespacePhase, NamespaceStateReader,
 };
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
-    ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
-    Node, Pod, ServiceAccount, TokenRequest,
+    ApiStatus, ConfigMap, ConfigMapList, DeleteOptions, FieldSelector, LabelSelector, Namespace,
+    NamespaceList, NamespacePhase, Node, NodeList, Pod, PodList, ServiceAccount,
+    ServiceAccountList, TokenRequest, TypeMeta,
 };
 use rusternetes_authn::{
     AuthenticationChain, KubernetesBoundObjectClaims, RequestIdentity, ServiceAccountJwksDocument,
@@ -587,6 +591,7 @@ pub struct AppState {
     admission: AdmissionChain,
     service_account_token_issuer: Option<ServiceAccountTokenIssuer>,
     service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
+    pagination: Arc<PaginationCache>,
 }
 
 impl AppState {
@@ -612,6 +617,7 @@ impl AppState {
             admission,
             service_account_token_issuer: None,
             service_account_oidc_discovery: None,
+            pagination: Arc::new(PaginationCache::default()),
         }
     }
 }
@@ -1161,6 +1167,234 @@ struct ListQuery {
     watch: Option<String>,
     #[serde(default)]
     allow_watch_bookmarks: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(rename = "continue", default)]
+    continue_token: Option<String>,
+}
+
+const MAX_LIST_PAGE_LIMIT: usize = 10_000;
+
+fn pagination_request(
+    query: &ListQuery,
+    resource: ListResource,
+    namespace: Option<&str>,
+) -> Result<ListPaginationRequest, ApiError> {
+    let limit = match query.limit {
+        None => None,
+        Some(limit) if limit < 0 => {
+            return Err(ApiError::BadRequest {
+                message: "limit must be a non-negative integer".to_owned(),
+            });
+        }
+        Some(limit) => {
+            let limit = usize::try_from(limit).map_err(|_| ApiError::BadRequest {
+                message: "limit is too large for this server".to_owned(),
+            })?;
+            if limit > MAX_LIST_PAGE_LIMIT {
+                return Err(ApiError::BadRequest {
+                    message: format!("limit must not exceed {MAX_LIST_PAGE_LIMIT}"),
+                });
+            }
+            Some(limit)
+        }
+    };
+    if query.continue_token.is_some() && limit == Some(0) {
+        return Err(ApiError::BadRequest {
+            message: "continue may not be combined with limit=0".to_owned(),
+        });
+    }
+    Ok(ListPaginationRequest {
+        resource,
+        namespace: namespace.map(str::to_owned),
+        label_selector: query
+            .label_selector
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        field_selector: query
+            .field_selector
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        limit,
+    })
+}
+
+fn reject_watch_pagination(query: &ListQuery) -> ApiResult<()> {
+    if query.limit.is_some() || query.continue_token.is_some() {
+        return Err(ApiError::BadRequest {
+            message: "limit and continue are not supported with watch=true".to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+async fn paginated_config_map_list(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: Option<&str>,
+    label_selector: &LabelSelector,
+    field_selector: &FieldSelector,
+) -> Result<ConfigMapList, ApiError> {
+    let request = pagination_request(query, ListResource::ConfigMaps, namespace)?;
+    let page = match query.continue_token.as_deref() {
+        Some(token) => state.pagination.continue_page(request, token).await?,
+        None => {
+            let list = state
+                .backend
+                .config_maps
+                .list(namespace, label_selector, field_selector)
+                .await?;
+            state
+                .pagination
+                .first_page(
+                    request,
+                    list.metadata.resource_version,
+                    SnapshotItems::ConfigMaps(list.items),
+                )
+                .await?
+        }
+    };
+    Ok(ConfigMapList {
+        type_meta: TypeMeta::config_map_list(),
+        metadata: page.metadata,
+        items: page.items.into_config_maps().ok_or(ApiError::Internal)?,
+    })
+}
+
+async fn paginated_pod_list(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: Option<&str>,
+    label_selector: &LabelSelector,
+    field_selector: &FieldSelector,
+) -> Result<PodList, ApiError> {
+    let request = pagination_request(query, ListResource::Pods, namespace)?;
+    let page = match query.continue_token.as_deref() {
+        Some(token) => state.pagination.continue_page(request, token).await?,
+        None => {
+            let list = state
+                .backend
+                .pods
+                .list(namespace, label_selector, field_selector)
+                .await?;
+            state
+                .pagination
+                .first_page(
+                    request,
+                    list.metadata.resource_version,
+                    SnapshotItems::Pods(list.items),
+                )
+                .await?
+        }
+    };
+    Ok(PodList {
+        type_meta: TypeMeta::pod_list(),
+        metadata: page.metadata,
+        items: page.items.into_pods().ok_or(ApiError::Internal)?,
+    })
+}
+
+async fn paginated_service_account_list(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: &str,
+    label_selector: &LabelSelector,
+    field_selector: &FieldSelector,
+) -> Result<ServiceAccountList, ApiError> {
+    let request = pagination_request(query, ListResource::ServiceAccounts, Some(namespace))?;
+    let page = match query.continue_token.as_deref() {
+        Some(token) => state.pagination.continue_page(request, token).await?,
+        None => {
+            let list = state
+                .backend
+                .service_accounts
+                .list(Some(namespace), label_selector, field_selector)
+                .await?;
+            state
+                .pagination
+                .first_page(
+                    request,
+                    list.metadata.resource_version,
+                    SnapshotItems::ServiceAccounts(list.items),
+                )
+                .await?
+        }
+    };
+    Ok(ServiceAccountList {
+        type_meta: TypeMeta::service_account_list(),
+        metadata: page.metadata,
+        items: page
+            .items
+            .into_service_accounts()
+            .ok_or(ApiError::Internal)?,
+    })
+}
+
+async fn paginated_namespace_list(
+    state: &AppState,
+    query: &ListQuery,
+    label_selector: &LabelSelector,
+    field_selector: &FieldSelector,
+) -> Result<NamespaceList, ApiError> {
+    let request = pagination_request(query, ListResource::Namespaces, None)?;
+    let page = match query.continue_token.as_deref() {
+        Some(token) => state.pagination.continue_page(request, token).await?,
+        None => {
+            let list = state
+                .backend
+                .namespaces
+                .list(label_selector, field_selector)
+                .await?;
+            state
+                .pagination
+                .first_page(
+                    request,
+                    list.metadata.resource_version,
+                    SnapshotItems::Namespaces(list.items),
+                )
+                .await?
+        }
+    };
+    Ok(NamespaceList {
+        type_meta: TypeMeta::namespace_list(),
+        metadata: page.metadata,
+        items: page.items.into_namespaces().ok_or(ApiError::Internal)?,
+    })
+}
+
+async fn paginated_node_list(
+    state: &AppState,
+    query: &ListQuery,
+    label_selector: &LabelSelector,
+    field_selector: &FieldSelector,
+) -> Result<NodeList, ApiError> {
+    let request = pagination_request(query, ListResource::Nodes, None)?;
+    let page = match query.continue_token.as_deref() {
+        Some(token) => state.pagination.continue_page(request, token).await?,
+        None => {
+            let list = state
+                .backend
+                .nodes
+                .list(label_selector, field_selector)
+                .await?;
+            state
+                .pagination
+                .first_page(
+                    request,
+                    list.metadata.resource_version,
+                    SnapshotItems::Nodes(list.items),
+                )
+                .await?
+        }
+    };
+    Ok(NodeList {
+        type_meta: TypeMeta::node_list(),
+        metadata: page.metadata,
+        items: page.items.into_nodes().ok_or(ApiError::Internal)?,
+    })
 }
 
 #[derive(Serialize)]
@@ -1246,17 +1480,14 @@ async fn list_all_config_maps(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_config_map_watch(&state, &query, None).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
-        state
-            .backend
-            .config_maps
-            .list(None, &label_selector, &field_selector)
-            .await?,
+        paginated_config_map_list(&state, &query, None, &label_selector, &field_selector).await?,
     )
     .into_response())
 }
@@ -1267,17 +1498,21 @@ async fn list_config_maps(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_config_map_watch(&state, &query, Some(namespace)).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
-        state
-            .backend
-            .config_maps
-            .list(Some(&namespace), &label_selector, &field_selector)
-            .await?,
+        paginated_config_map_list(
+            &state,
+            &query,
+            Some(&namespace),
+            &label_selector,
+            &field_selector,
+        )
+        .await?,
     )
     .into_response())
 }
@@ -1362,17 +1597,21 @@ async fn list_service_accounts(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_service_account_watch(&state, &query, namespace).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
-        state
-            .backend
-            .service_accounts
-            .list(Some(&namespace), &label_selector, &field_selector)
-            .await?,
+        paginated_service_account_list(
+            &state,
+            &query,
+            &namespace,
+            &label_selector,
+            &field_selector,
+        )
+        .await?,
     )
     .into_response())
 }
@@ -1570,19 +1809,16 @@ async fn list_all_pods(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_pod_watch(&state, &query, None).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
-    Ok(Json(
-        state
-            .backend
-            .pods
-            .list(None, &label_selector, &field_selector)
-            .await?,
+    Ok(
+        Json(paginated_pod_list(&state, &query, None, &label_selector, &field_selector).await?)
+            .into_response(),
     )
-    .into_response())
 }
 
 async fn list_pods(
@@ -1591,17 +1827,21 @@ async fn list_pods(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_pod_watch(&state, &query, Some(namespace)).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
     Ok(Json(
-        state
-            .backend
-            .pods
-            .list(Some(&namespace), &label_selector, &field_selector)
-            .await?,
+        paginated_pod_list(
+            &state,
+            &query,
+            Some(&namespace),
+            &label_selector,
+            &field_selector,
+        )
+        .await?,
     )
     .into_response())
 }
@@ -1699,19 +1939,16 @@ async fn list_namespaces(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_namespace_watch(&state, &query).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
-    Ok(Json(
-        state
-            .backend
-            .namespaces
-            .list(&label_selector, &field_selector)
-            .await?,
+    Ok(
+        Json(paginated_namespace_list(&state, &query, &label_selector, &field_selector).await?)
+            .into_response(),
     )
-    .into_response())
 }
 
 async fn create_namespace(
@@ -1824,19 +2061,16 @@ async fn list_nodes(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Response> {
     if is_watch_request(&query)? {
+        reject_watch_pagination(&query)?;
         return open_node_watch(&state, &query).await;
     }
     reject_list_resource_version(&query)?;
     let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
     let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
-    Ok(Json(
-        state
-            .backend
-            .nodes
-            .list(&label_selector, &field_selector)
-            .await?,
+    Ok(
+        Json(paginated_node_list(&state, &query, &label_selector, &field_selector).await?)
+            .into_response(),
     )
-    .into_response())
 }
 
 async fn create_node(
@@ -3853,5 +4087,177 @@ mod tests {
             backend_from_etcd_config(Some("http://127.0.0.1:2379"), Some("invalid-prefix")).await,
             Err(ApiError::BadRequest { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod pagination_route_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use rusternetes_api_types::{ConfigMap, ConfigMapList, ObjectMeta, TypeMeta};
+    use rusternetes_common::StatusReason;
+    use rusternetes_storage::InMemoryConfigMapStore;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn config_map(name: &str, namespace: &str, tier: &str) -> ConfigMap {
+        ConfigMap {
+            type_meta: TypeMeta::config_map(),
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                namespace: Some(namespace.to_owned()),
+                labels: BTreeMap::from([("tier".to_owned(), tier.to_owned())]),
+                ..ObjectMeta::default()
+            },
+            ..ConfigMap::default()
+        }
+    }
+
+    async fn decode_list(response: axum::response::Response) -> ConfigMapList {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("list body is readable"),
+        )
+        .expect("list response is ConfigMapList JSON")
+    }
+
+    async fn decode_status(response: axum::response::Response) -> ApiStatus {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("status body is readable"),
+        )
+        .expect("error response is Kubernetes Status JSON")
+    }
+
+    #[tokio::test]
+    async fn config_map_pagination_is_snapshot_consistent_and_token_bound_to_scope_and_selector() {
+        let store = Arc::new(InMemoryConfigMapStore::new());
+        for name in ["a", "b", "c"] {
+            store
+                .create(config_map(name, "default", "frontend"))
+                .await
+                .expect("fixture ConfigMap creates");
+        }
+        store
+            .create(config_map("backend", "default", "backend"))
+            .await
+            .expect("non-matching fixture ConfigMap creates");
+        let app = router(store.clone());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/namespaces/default/configmaps?limit=2&labelSelector=tier%3Dfrontend")
+                    .body(Body::empty())
+                    .expect("valid first page request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = decode_list(first).await;
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.metadata.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("b")]
+        );
+        assert_eq!(first.metadata.remaining_item_count, None);
+        let initial_resource_version = first.metadata.resource_version.clone();
+        let first_token = first
+            .metadata
+            .continue_token
+            .clone()
+            .expect("first page returns opaque continue token");
+
+        let mismatched_scope = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/namespaces/other/configmaps?continue={first_token}"
+                    ))
+                    .body(Body::empty())
+                    .expect("valid scope-mismatch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(mismatched_scope.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            decode_status(mismatched_scope).await.reason,
+            StatusReason::BadRequest
+        );
+
+        let mismatched_selector = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/namespaces/default/configmaps?continue={first_token}&labelSelector=tier%3Dbackend"
+                    ))
+                    .body(Body::empty())
+                    .expect("valid selector-mismatch request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(mismatched_selector.status(), StatusCode::BAD_REQUEST);
+
+        store
+            .create(config_map("later", "default", "frontend"))
+            .await
+            .expect("post-snapshot ConfigMap creates");
+        let final_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/namespaces/default/configmaps?continue={first_token}&labelSelector=tier%3Dfrontend"
+                    ))
+                    .body(Body::empty())
+                    .expect("valid continuation request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(final_page.status(), StatusCode::OK);
+        let final_page = decode_list(final_page).await;
+        assert_eq!(final_page.items.len(), 1);
+        assert_eq!(final_page.items[0].metadata.name.as_deref(), Some("c"));
+        assert_eq!(
+            final_page.metadata.resource_version,
+            initial_resource_version
+        );
+        assert!(final_page.metadata.continue_token.is_none());
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/namespaces/default/configmaps?continue=not+url-safe")
+                    .body(Body::empty())
+                    .expect("valid malformed-token request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let incompatible_watch = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/namespaces/default/configmaps?watch=true&limit=1")
+                    .body(Body::empty())
+                    .expect("valid watch pagination request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(incompatible_watch.status(), StatusCode::BAD_REQUEST);
     }
 }

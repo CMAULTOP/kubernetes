@@ -1398,6 +1398,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum 0.7.9",
+ "base64",
  "http",
  "json-patch",
  "rusternetes-admission",
@@ -1413,6 +1414,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

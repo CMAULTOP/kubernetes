@@ -1090,3 +1090,71 @@ async fn service_account_api_persists_through_configured_etcd_backend() {
         .expect("direct etcd read succeeds");
     assert_eq!(persisted, updated);
 }
+
+#[tokio::test]
+async fn config_map_pagination_preserves_an_etcd_snapshot_across_continuation_requests() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-pagination-tests/{}", Uuid::new_v4());
+    let repository = Arc::new(
+        EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+            .await
+            .unwrap_or_else(|error| panic!("etcd ConfigMap repository connects: {error}")),
+    );
+    let server = start_server(repository).await;
+    let client = reqwest::Client::new();
+    let collection = format!("{}/api/v1/namespaces/default/configmaps", server.base_url);
+
+    for name in ["a", "b", "c"] {
+        let response = client
+            .post(&collection)
+            .json(&config_map(name, "default", "frontend"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{name} ConfigMap create completes: {error}"));
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    }
+
+    let first_response = client
+        .get(format!("{}/api/v1/configmaps", server.base_url))
+        .query(&[("limit", "2")])
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("first paginated list completes: {error}"));
+    assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+    let first: ConfigMapList = first_response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("first page is ConfigMapList JSON: {error}"));
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.metadata.remaining_item_count, Some(1));
+    let resource_version = first.metadata.resource_version.clone();
+    let continue_token = first
+        .metadata
+        .continue_token
+        .clone()
+        .expect("first etcd page supplies continue token");
+
+    let late_response = client
+        .post(&collection)
+        .json(&config_map("late", "default", "frontend"))
+        .send()
+        .await
+        .expect("post-snapshot ConfigMap create completes");
+    assert_eq!(late_response.status(), reqwest::StatusCode::CREATED);
+
+    let final_response = client
+        .get(format!("{}/api/v1/configmaps", server.base_url))
+        .query(&[("continue", continue_token.as_str())])
+        .send()
+        .await
+        .expect("etcd continuation request completes");
+    assert_eq!(final_response.status(), reqwest::StatusCode::OK);
+    let final_page: ConfigMapList = final_response
+        .json()
+        .await
+        .expect("final page is ConfigMapList JSON");
+    assert_eq!(final_page.items.len(), 1);
+    assert_eq!(final_page.items[0].metadata.name.as_deref(), Some("c"));
+    assert_eq!(final_page.metadata.resource_version, resource_version);
+    assert!(final_page.metadata.continue_token.is_none());
+}

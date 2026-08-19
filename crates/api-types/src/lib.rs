@@ -1145,6 +1145,7 @@ impl PodList {
             type_meta: TypeMeta::pod_list(),
             metadata: ListMeta {
                 resource_version: Some(resource_version),
+                ..ListMeta::default()
             },
             items,
         }
@@ -1167,6 +1168,7 @@ impl ServiceAccountList {
             type_meta: TypeMeta::service_account_list(),
             metadata: ListMeta {
                 resource_version: Some(resource_version),
+                ..ListMeta::default()
             },
             items,
         }
@@ -1189,6 +1191,7 @@ impl NamespaceList {
             type_meta: TypeMeta::namespace_list(),
             metadata: ListMeta {
                 resource_version: Some(resource_version),
+                ..ListMeta::default()
             },
             items,
         }
@@ -1201,6 +1204,10 @@ impl NamespaceList {
 pub struct ListMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
+    #[serde(rename = "continue", default, skip_serializing_if = "Option::is_none")]
+    pub continue_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_item_count: Option<i64>,
 }
 
 /// A typed ConfigMap list response.
@@ -1219,6 +1226,7 @@ impl ConfigMapList {
             type_meta: TypeMeta::config_map_list(),
             metadata: ListMeta {
                 resource_version: Some(resource_version),
+                ..ListMeta::default()
             },
             items,
         }
@@ -2133,6 +2141,7 @@ impl NodeList {
             type_meta: TypeMeta::node_list(),
             metadata: ListMeta {
                 resource_version: Some(resource_version),
+                ..ListMeta::default()
             },
             items,
         }
