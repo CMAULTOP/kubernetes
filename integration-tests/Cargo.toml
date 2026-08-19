@@ -14,6 +14,7 @@ futures-util.workspace = true
 idna_adapter.workspace = true
 reqwest.workspace = true
 rusternetes-api-server = { path = "../crates/api-server" }
+rusternetes-admission = { path = "../crates/admission" }
 rusternetes-api-types = { path = "../crates/api-types" }
 rusternetes-authn = { path = "../crates/authn" }
 rusternetes-authz-rbac = { path = "../crates/authz-rbac" }

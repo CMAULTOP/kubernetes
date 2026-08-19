@@ -880,6 +880,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
+name = "rusternetes-admission"
+version = "0.1.0"
+dependencies = [
+ "rusternetes-api-types",
+ "rusternetes-authn",
+ "rusternetes-common",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rusternetes-api-registry"
 version = "0.1.0"
 dependencies = [
@@ -893,6 +904,7 @@ dependencies = [
  "async-stream",
  "axum 0.7.9",
  "http",
+ "rusternetes-admission",
  "rusternetes-api-registry",
  "rusternetes-api-types",
  "rusternetes-authn",
@@ -950,6 +962,7 @@ dependencies = [
  "futures-util",
  "idna_adapter",
  "reqwest",
+ "rusternetes-admission",
  "rusternetes-api-server",
  "rusternetes-api-types",
  "rusternetes-authn",

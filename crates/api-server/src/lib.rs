@@ -5,13 +5,14 @@ use std::{io, sync::Arc};
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use rusternetes_admission::{AdmissionChain, AdmissionRequest};
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector};
 use rusternetes_authn::{AuthenticationChain, RequestIdentity};
@@ -128,26 +129,30 @@ pub struct AppState {
     backend: ConfigMapBackend,
     registry: ApiRegistry,
     authorization: AuthorizationMode,
+    admission: AdmissionChain,
 }
 
 impl AppState {
     pub fn new(backend: ConfigMapBackend) -> Self {
-        Self::with_registry_and_authorization(
+        Self::with_registry_authorization_and_admission(
             backend,
             ApiRegistry::core_v1(),
             AuthorizationMode::default(),
+            AdmissionChain::default(),
         )
     }
 
-    pub fn with_registry_and_authorization(
+    pub fn with_registry_authorization_and_admission(
         backend: ConfigMapBackend,
         registry: ApiRegistry,
         authorization: AuthorizationMode,
+        admission: AdmissionChain,
     ) -> Self {
         Self {
             backend,
             registry,
             authorization,
+            admission,
         }
     }
 }
@@ -191,14 +196,35 @@ pub fn router_with_backend_and_auth(
 /// Builds the API Server router with explicit storage, authentication, and authorization layers.
 ///
 /// Middleware order is fixed: credentials establish `RequestIdentity`, RBAC evaluates that identity
-/// and normalized request attributes, then the resource handler may execute.
+/// and normalized request attributes, then the handler executes typed validating admission before
+/// it invokes any persistence mutation.
 pub fn router_with_backend_auth_and_authorization(
     backend: ConfigMapBackend,
     authentication: AuthenticationChain,
     authorization: AuthorizationMode,
 ) -> Router {
-    let state =
-        AppState::with_registry_and_authorization(backend, ApiRegistry::core_v1(), authorization);
+    router_with_backend_auth_authorization_and_admission(
+        backend,
+        authentication,
+        authorization,
+        AdmissionChain::default(),
+    )
+}
+
+/// Builds the API Server router with explicit storage, authentication, authorization, and
+/// pre-persistence validating admission implementations.
+pub fn router_with_backend_auth_authorization_and_admission(
+    backend: ConfigMapBackend,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
+    admission: AdmissionChain,
+) -> Router {
+    let state = AppState::with_registry_authorization_and_admission(
+        backend,
+        ApiRegistry::core_v1(),
+        authorization,
+        admission,
+    );
     Router::new()
         .route("/version", get(version))
         .route("/api", get(api_versions))
@@ -472,10 +498,13 @@ async fn list_config_maps(
 
 async fn create_config_map(
     State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
     Path(namespace): Path<String>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<ConfigMap>)> {
     let resource = bind_namespace(decode_config_map(body)?, &namespace)?;
+    let admission_request = AdmissionRequest::create(identity, resource.clone())?;
+    state.admission.validate(&admission_request).await?;
     let created = state.backend.create(resource).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -489,19 +518,27 @@ async fn get_config_map(
 
 async fn replace_config_map(
     State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
     Path((namespace, name)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<Json<ConfigMap>> {
     let resource = bind_update_identity(decode_config_map(body)?, &namespace, &name)?;
+    let old_object = state.backend.get(&namespace, &name).await?;
+    let admission_request = AdmissionRequest::update(identity, resource.clone(), old_object)?;
+    state.admission.validate(&admission_request).await?;
     Ok(Json(state.backend.update(resource).await?))
 }
 
 async fn delete_config_map(
     State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
     Path((namespace, name)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<Json<ApiStatus>> {
     let options = decode_delete_options(body)?;
+    let old_object = state.backend.get(&namespace, &name).await?;
+    let admission_request = AdmissionRequest::delete(identity, old_object)?;
+    state.admission.validate(&admission_request).await?;
     let result = state.backend.delete(&namespace, &name, options).await?;
     Ok(Json(ApiStatus::success(format!(
         "configmaps {name:?} deleted at resourceVersion {}",

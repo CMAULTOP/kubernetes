@@ -8,12 +8,18 @@ use std::{
     time::Duration,
 };
 
+use rusternetes_admission::{
+    AdmissionChain, NamespaceLifecyclePlugin, NamespacePhase, StaticNamespaceStateReader,
+};
 use rusternetes_api_server::{
-    router_with_backend_auth_and_authorization, AuthorizationMode, ConfigMapBackend,
+    router_with_backend_auth_authorization_and_admission, AuthorizationMode, ConfigMapBackend,
 };
 use rusternetes_api_types::{ApiStatus, ConfigMap, ConfigMapList, ObjectMeta, TypeMeta};
 use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
-use rusternetes_authz_rbac::{PolicyRule, RbacAuthorizer, Role, RoleBinding, RoleRef, Subject};
+use rusternetes_authz_rbac::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, RbacAuthorizer, Role, RoleBinding, RoleRef,
+    Subject,
+};
 use rusternetes_common::StatusReason;
 use rusternetes_storage_etcd::EtcdConfigMapRepository;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -121,16 +127,32 @@ async fn start_server_with_authorization(
     authentication: AuthenticationChain,
     authorization: AuthorizationMode,
 ) -> TestServer {
+    start_server_with_authorization_and_admission(
+        repository,
+        authentication,
+        authorization,
+        AdmissionChain::default(),
+    )
+    .await
+}
+
+async fn start_server_with_authorization_and_admission(
+    repository: Arc<EtcdConfigMapRepository>,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
+    admission: AdmissionChain,
+) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|error| panic!("HTTP listener binds: {error}"));
     let address = listener
         .local_addr()
         .unwrap_or_else(|error| panic!("HTTP listener reports address: {error}"));
-    let application = router_with_backend_auth_and_authorization(
+    let application = router_with_backend_auth_authorization_and_admission(
         ConfigMapBackend::Etcd(repository),
         authentication,
         authorization,
+        admission,
     );
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, application).await {
@@ -495,4 +517,87 @@ async fn http_rbac_allows_only_bound_namespace_after_authentication() {
         .unwrap_or_else(|error| panic!("403 response is Kubernetes Status: {error}"));
     assert_eq!(status.reason, StatusReason::Forbidden);
     assert!(repository.get("production", "settings").await.is_err());
+}
+
+#[tokio::test]
+async fn http_admission_rejects_rbac_authorized_create_in_missing_namespace_before_etcd_mutation() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-admission/{}", Uuid::new_v4());
+    let repository = Arc::new(
+        EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+            .await
+            .expect("etcd repository connects"),
+    );
+    let identity = RequestIdentity::authenticated(
+        "namespace-writer",
+        None,
+        std::iter::empty(),
+        Default::default(),
+    )
+    .expect("identity is valid");
+    let token = StaticBearerToken::new("writer-secret", identity).expect("token is valid");
+    let policy = RbacAuthorizer::new(
+        Vec::new(),
+        vec![ClusterRole {
+            name: "configmap-writer".to_owned(),
+            rules: vec![PolicyRule {
+                api_groups: vec![String::new()],
+                resources: vec!["configmaps".to_owned()],
+                verbs: vec!["create".to_owned()],
+                ..PolicyRule::default()
+            }],
+        }],
+        Vec::new(),
+        vec![ClusterRoleBinding {
+            name: "writer-binding".to_owned(),
+            subjects: vec![Subject::User("namespace-writer".to_owned())],
+            role_ref: "configmap-writer".to_owned(),
+        }],
+    );
+    let namespaces =
+        StaticNamespaceStateReader::new([("development".to_owned(), NamespacePhase::Active)]);
+    let admission = AdmissionChain::new(vec![Arc::new(NamespaceLifecyclePlugin::new(Arc::new(
+        namespaces,
+    )))]);
+    let server = start_server_with_authorization_and_admission(
+        repository.clone(),
+        AuthenticationChain::new(AnonymousPolicy::Deny, vec![token]),
+        AuthorizationMode::Rbac(policy),
+        admission,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let missing = client
+        .post(format!(
+            "{}/api/v1/namespaces/missing/configmaps",
+            server.base_url
+        ))
+        .header("authorization", "Bearer writer-secret")
+        .json(&config_map("missing-settings", "missing", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("RBAC-authorized missing namespace create completes: {error}")
+        });
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let status: ApiStatus = missing
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("admission rejection is Kubernetes Status JSON: {error}"));
+    assert_eq!(status.reason, StatusReason::NotFound);
+    assert!(repository.get("missing", "missing-settings").await.is_err());
+
+    let allowed = client
+        .post(format!(
+            "{}/api/v1/namespaces/development/configmaps",
+            server.base_url
+        ))
+        .header("authorization", "Bearer writer-secret")
+        .json(&config_map("settings", "development", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("active namespace create completes: {error}"));
+    assert_eq!(allowed.status(), reqwest::StatusCode::CREATED);
+    assert!(repository.get("development", "settings").await.is_ok());
 }

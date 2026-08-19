@@ -5,6 +5,7 @@ members = [
     "crates/authn",
     "crates/authz-rbac",
     "crates/api-registry",
+    "crates/admission",
     "crates/api-types",
     "crates/storage",
     "crates/storage-etcd",

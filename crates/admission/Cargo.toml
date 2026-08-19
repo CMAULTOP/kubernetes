@@ -1,0 +1,16 @@
+[package]
+name = "rusternetes-admission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusternetes-api-types = { path = "../api-types" }
+rusternetes-authn = { path = "../authn" }
+rusternetes-common = { path = "../common" }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
