@@ -72,6 +72,15 @@ impl ResourceReference {
         }
     }
 
+    pub fn service_account(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            group: String::new(),
+            resource: "serviceaccounts".to_owned(),
+            namespace: Some(namespace.into()),
+            name: Some(name.into()),
+        }
+    }
+
     pub fn namespace(name: impl Into<String>) -> Self {
         Self {
             group: String::new(),

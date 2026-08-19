@@ -1,7 +1,7 @@
 use rusternetes_api_server::{core_backend_from_etcd_config, router_with_core_backend};
 use rusternetes_api_types::{
     ApiStatus, Container, Namespace, NamespaceList, ObjectMeta, Pod, PodList, PodPhase, PodSpec,
-    TypeMeta,
+    ServiceAccount, TypeMeta,
 };
 use rusternetes_common::StatusReason;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -62,6 +62,21 @@ fn pod(name: &str, namespace: Option<&str>, image: &str) -> Pod {
     }
 }
 
+fn service_account(name: &str, namespace: Option<&str>) -> ServiceAccount {
+    ServiceAccount {
+        type_meta: TypeMeta::service_account(),
+        metadata: ObjectMeta {
+            name: Some(name.to_owned()),
+            namespace: namespace.map(str::to_owned),
+            labels: [("team".to_owned(), "platform".to_owned())]
+                .into_iter()
+                .collect(),
+            ..ObjectMeta::default()
+        },
+        ..ServiceAccount::default()
+    }
+}
+
 fn namespace(name: &str) -> Namespace {
     Namespace {
         type_meta: TypeMeta::namespace(),
@@ -78,6 +93,59 @@ async fn response_status(response: reqwest::Response) -> ApiStatus {
         .json()
         .await
         .unwrap_or_else(|error| panic!("error response uses Kubernetes Status JSON: {error}"))
+}
+
+#[tokio::test]
+async fn service_account_crud_is_executable_with_cas_and_typed_metadata() {
+    let server = start_server().await;
+    let client = reqwest::Client::new();
+    let collection = format!(
+        "{}/api/v1/namespaces/default/serviceaccounts",
+        server.base_url
+    );
+    let created_response = client
+        .post(&collection)
+        .json(&service_account("build-robot", None))
+        .send()
+        .await
+        .expect("ServiceAccount create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: ServiceAccount = created_response.json().await.expect("typed response");
+    assert!(created.metadata.uid.is_some());
+    assert!(created.metadata.resource_version.is_some());
+
+    let listed_response = client
+        .get(&collection)
+        .send()
+        .await
+        .expect("list completes");
+    assert_eq!(listed_response.status(), reqwest::StatusCode::OK);
+    let listed: serde_json::Value = listed_response.json().await.expect("list is JSON");
+    assert_eq!(listed["items"].as_array().map(Vec::len), Some(1));
+
+    let mut update = created.clone();
+    update.automount_service_account_token = Some(false);
+    let update_response = client
+        .put(format!("{collection}/build-robot"))
+        .json(&update)
+        .send()
+        .await
+        .expect("update completes");
+    assert_eq!(update_response.status(), reqwest::StatusCode::OK);
+    let updated: ServiceAccount = update_response.json().await.expect("typed update response");
+    assert_eq!(updated.automount_service_account_token, Some(false));
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let stale_response = client
+        .put(format!("{collection}/build-robot"))
+        .json(&created)
+        .send()
+        .await
+        .expect("stale update completes");
+    assert_eq!(stale_response.status(), reqwest::StatusCode::CONFLICT);
 }
 
 #[tokio::test]

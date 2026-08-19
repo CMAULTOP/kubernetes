@@ -17,7 +17,7 @@ use rusternetes_api_server::{
 };
 use rusternetes_api_types::{
     ApiStatus, ConfigMap, ConfigMapList, Container, Namespace, Node, ObjectMeta, Pod, PodPhase,
-    PodSpec, TypeMeta,
+    PodSpec, ServiceAccount, TypeMeta,
 };
 use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
 use rusternetes_authz_rbac::{
@@ -25,7 +25,9 @@ use rusternetes_authz_rbac::{
     Subject,
 };
 use rusternetes_common::StatusReason;
-use rusternetes_storage_etcd::{EtcdConfigMapRepository, EtcdNodeRepository, EtcdPodRepository};
+use rusternetes_storage_etcd::{
+    EtcdConfigMapRepository, EtcdNodeRepository, EtcdPodRepository, EtcdServiceAccountRepository,
+};
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
@@ -843,4 +845,62 @@ async fn http_core_backend_persists_pods_in_real_etcd_without_memory_fallback() 
         .unwrap_or_else(|error| panic!("Pod is durable in real etcd: {error}"));
     assert_eq!(persisted.metadata.name.as_deref(), Some("web"));
     assert_eq!(persisted.status.phase, Some(PodPhase::Pending));
+}
+
+#[tokio::test]
+async fn service_account_api_persists_through_configured_etcd_backend() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-serviceaccounts/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let repository = EtcdServiceAccountRepository::connect(
+        [endpoint.as_str()],
+        Some(&format!("{prefix}/serviceaccounts")),
+    )
+    .await
+    .expect("direct ServiceAccount repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let collection = format!(
+        "{}/api/v1/namespaces/default/serviceaccounts",
+        server.base_url
+    );
+    let resource = ServiceAccount {
+        type_meta: TypeMeta::service_account(),
+        metadata: ObjectMeta {
+            name: Some("build-robot".to_owned()),
+            ..ObjectMeta::default()
+        },
+        ..ServiceAccount::default()
+    };
+    let created_response = client
+        .post(&collection)
+        .json(&resource)
+        .send()
+        .await
+        .expect("ServiceAccount create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+    let created: ServiceAccount = created_response.json().await.expect("typed response");
+
+    let mut update = created.clone();
+    update.automount_service_account_token = Some(false);
+    let updated_response = client
+        .put(format!("{collection}/build-robot"))
+        .json(&update)
+        .send()
+        .await
+        .expect("ServiceAccount update completes");
+    assert_eq!(updated_response.status(), reqwest::StatusCode::OK);
+    let updated: ServiceAccount = updated_response.json().await.expect("typed response");
+    assert_ne!(
+        updated.metadata.resource_version,
+        created.metadata.resource_version
+    );
+
+    let persisted = repository
+        .get("default", "build-robot")
+        .await
+        .expect("direct etcd read succeeds");
+    assert_eq!(persisted, updated);
 }

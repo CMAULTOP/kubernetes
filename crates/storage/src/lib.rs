@@ -17,10 +17,14 @@ use uuid::Uuid;
 
 mod node;
 mod pod_namespace;
+mod service_account;
 pub use node::{InMemoryNodeStore, NodeWatchRequest, NodeWatchSubscription};
 pub use pod_namespace::{
     InMemoryNamespaceStore, InMemoryPodStore, NamespaceWatchRequest, NamespaceWatchSubscription,
     PodWatchRequest, PodWatchSubscription,
+};
+pub use service_account::{
+    InMemoryServiceAccountStore, ServiceAccountWatchRequest, ServiceAccountWatchSubscription,
 };
 
 /// Maximum retained ConfigMap events in the single-process history window.

@@ -19,7 +19,7 @@ use rusternetes_admission::{
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
     ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
-    Node, Pod,
+    Node, Pod, ServiceAccount,
 };
 use rusternetes_authn::{AuthenticationChain, RequestIdentity};
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
@@ -27,15 +27,17 @@ use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
     ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
     DeleteResult, InMemoryConfigMapStore, InMemoryNamespaceStore, InMemoryNodeStore,
-    InMemoryPodStore, NamespaceWatchRequest,
+    InMemoryPodStore, InMemoryServiceAccountStore, NamespaceWatchRequest,
     NamespaceWatchSubscription as InMemoryNamespaceWatchSubscription, NodeWatchRequest,
     NodeWatchSubscription as InMemoryNodeWatchSubscription, PodWatchRequest,
-    PodWatchSubscription as InMemoryPodWatchSubscription,
+    PodWatchSubscription as InMemoryPodWatchSubscription, ServiceAccountWatchRequest,
+    ServiceAccountWatchSubscription as InMemoryServiceAccountWatchSubscription,
 };
 use rusternetes_storage_etcd::{
     EtcdConfigMapRepository, EtcdConfigMapWatchSubscription, EtcdNamespaceRepository,
     EtcdNamespaceWatchSubscription, EtcdNodeRepository, EtcdNodeWatchSubscription,
-    EtcdPodRepository, EtcdPodWatchSubscription,
+    EtcdPodRepository, EtcdPodWatchSubscription, EtcdServiceAccountRepository,
+    EtcdServiceAccountWatchSubscription,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -228,6 +230,99 @@ impl PodBackend {
     }
 }
 
+/// The ServiceAccount persistence implementation selected alongside other core/v1 backends.
+#[derive(Clone)]
+pub enum ServiceAccountBackend {
+    InMemory(Arc<InMemoryServiceAccountStore>),
+    Etcd(Arc<EtcdServiceAccountRepository>),
+}
+
+pub enum ServiceAccountWatchSubscription {
+    InMemory(InMemoryServiceAccountWatchSubscription),
+    Etcd(EtcdServiceAccountWatchSubscription),
+}
+
+impl ServiceAccountWatchSubscription {
+    async fn recv(&mut self) -> Option<rusternetes_api_types::ServiceAccountWatchEvent> {
+        match self {
+            Self::InMemory(subscription) => subscription.recv().await,
+            Self::Etcd(subscription) => subscription.recv().await,
+        }
+    }
+}
+
+impl ServiceAccountBackend {
+    async fn create(&self, resource: ServiceAccount) -> Result<ServiceAccount, ApiError> {
+        match self {
+            Self::InMemory(store) => store.create(resource).await,
+            Self::Etcd(repository) => repository.create(resource).await,
+        }
+    }
+
+    async fn get(&self, namespace: &str, name: &str) -> Result<ServiceAccount, ApiError> {
+        match self {
+            Self::InMemory(store) => store.get(namespace, name).await,
+            Self::Etcd(repository) => repository.get(namespace, name).await,
+        }
+    }
+
+    async fn list(
+        &self,
+        namespace: Option<&str>,
+        label_selector: &LabelSelector,
+        field_selector: &FieldSelector,
+    ) -> Result<rusternetes_api_types::ServiceAccountList, ApiError> {
+        match (self, namespace) {
+            (Self::InMemory(store), namespace) => {
+                Ok(store.list(namespace, label_selector, field_selector).await)
+            }
+            (Self::Etcd(repository), Some(namespace)) => {
+                repository
+                    .list(namespace, label_selector, field_selector)
+                    .await
+            }
+            (Self::Etcd(repository), None) => {
+                repository.list_all(label_selector, field_selector).await
+            }
+        }
+    }
+
+    async fn update(&self, resource: ServiceAccount) -> Result<ServiceAccount, ApiError> {
+        match self {
+            Self::InMemory(store) => store.update(resource).await,
+            Self::Etcd(repository) => repository.update(resource).await,
+        }
+    }
+
+    async fn delete(
+        &self,
+        namespace: &str,
+        name: &str,
+        options: DeleteOptions,
+    ) -> Result<DeleteResult, ApiError> {
+        match self {
+            Self::InMemory(store) => store.delete(namespace, name, options).await,
+            Self::Etcd(repository) => repository.delete(namespace, name, options).await,
+        }
+    }
+
+    async fn watch(
+        &self,
+        request: ServiceAccountWatchRequest,
+    ) -> Result<ServiceAccountWatchSubscription, ApiError> {
+        match self {
+            Self::InMemory(store) => store
+                .watch(request)
+                .await
+                .map(ServiceAccountWatchSubscription::InMemory),
+            Self::Etcd(repository) => repository
+                .watch(request)
+                .await
+                .map(ServiceAccountWatchSubscription::Etcd),
+        }
+    }
+}
+
 /// The cluster-scoped Namespace persistence implementation selected with other core/v1 stores.
 #[derive(Clone)]
 pub enum NamespaceBackend {
@@ -393,6 +488,7 @@ impl NodeBackend {
 pub struct CoreApiBackend {
     pub config_maps: ConfigMapBackend,
     pub pods: PodBackend,
+    pub service_accounts: ServiceAccountBackend,
     pub namespaces: NamespaceBackend,
     pub nodes: NodeBackend,
 }
@@ -447,6 +543,9 @@ impl CoreApiBackend {
         Self {
             config_maps,
             pods: PodBackend::InMemory(Arc::new(InMemoryPodStore::new())),
+            service_accounts: ServiceAccountBackend::InMemory(Arc::new(
+                InMemoryServiceAccountStore::new(),
+            )),
             namespaces: NamespaceBackend::InMemory(Arc::new(InMemoryNamespaceStore::new())),
             nodes: NodeBackend::InMemory(Arc::new(InMemoryNodeStore::new())),
         }
@@ -616,6 +715,16 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             "/api/v1/namespaces/:namespace/pods/:name",
             get(get_pod).put(replace_pod).delete(delete_pod),
         )
+        .route(
+            "/api/v1/namespaces/:namespace/serviceaccounts",
+            get(list_service_accounts).post(create_service_account),
+        )
+        .route(
+            "/api/v1/namespaces/:namespace/serviceaccounts/:name",
+            get(get_service_account)
+                .put(replace_service_account)
+                .delete(delete_service_account),
+        )
         .fallback(not_found)
         // Axum applies the last layer first. Authentication must populate extensions before RBAC
         // evaluates them, so authorization is added before authentication here.
@@ -704,17 +813,22 @@ pub async fn core_backend_from_etcd_config(
         .unwrap_or("/registry");
     let config_maps_prefix = core_resource_prefix(root, "configmaps")?;
     let pods_prefix = core_resource_prefix(root, "pods")?;
+    let service_accounts_prefix = core_resource_prefix(root, "serviceaccounts")?;
     let namespaces_prefix = core_resource_prefix(root, "namespaces")?;
     let nodes_prefix = core_resource_prefix(root, "nodes")?;
     let config_maps =
         EtcdConfigMapRepository::connect(endpoints.clone(), Some(&config_maps_prefix)).await?;
     let pods = EtcdPodRepository::connect(endpoints.clone(), Some(&pods_prefix)).await?;
+    let service_accounts =
+        EtcdServiceAccountRepository::connect(endpoints.clone(), Some(&service_accounts_prefix))
+            .await?;
     let namespaces =
         EtcdNamespaceRepository::connect(endpoints.clone(), Some(&namespaces_prefix)).await?;
     let nodes = EtcdNodeRepository::connect(endpoints, Some(&nodes_prefix)).await?;
     let backend = CoreApiBackend {
         config_maps: ConfigMapBackend::Etcd(Arc::new(config_maps)),
         pods: PodBackend::Etcd(Arc::new(pods)),
+        service_accounts: ServiceAccountBackend::Etcd(Arc::new(service_accounts)),
         namespaces: NamespaceBackend::Etcd(Arc::new(namespaces)),
         nodes: NodeBackend::Etcd(Arc::new(nodes)),
     };
@@ -1017,6 +1131,77 @@ async fn delete_config_map(
     ))))
 }
 
+async fn list_service_accounts(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Response> {
+    if is_watch_request(&query)? {
+        return open_service_account_watch(&state, &query, namespace).await;
+    }
+    reject_list_resource_version(&query)?;
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    Ok(Json(
+        state
+            .backend
+            .service_accounts
+            .list(Some(&namespace), &label_selector, &field_selector)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn create_service_account(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<ServiceAccount>)> {
+    let resource = bind_service_account_namespace(decode_service_account(body)?, &namespace)?;
+    let created = state.backend.service_accounts.create(resource).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn get_service_account(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> ApiResult<Json<ServiceAccount>> {
+    Ok(Json(
+        state
+            .backend
+            .service_accounts
+            .get(&namespace, &name)
+            .await?,
+    ))
+}
+
+async fn replace_service_account(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<ServiceAccount>> {
+    let resource =
+        bind_service_account_update_identity(decode_service_account(body)?, &namespace, &name)?;
+    Ok(Json(state.backend.service_accounts.update(resource).await?))
+}
+
+async fn delete_service_account(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<ApiStatus>> {
+    let options = decode_delete_options(body)?;
+    let result = state
+        .backend
+        .service_accounts
+        .delete(&namespace, &name, options)
+        .await?;
+    Ok(Json(ApiStatus::success(format!(
+        "serviceaccounts {name:?} deleted at resourceVersion {}",
+        result.resource_version
+    ))))
+}
+
 async fn list_all_pods(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -1305,6 +1490,30 @@ async fn open_config_map_watch(
     Ok(watch_response(subscription))
 }
 
+async fn open_service_account_watch(
+    state: &AppState,
+    query: &ListQuery,
+    namespace: String,
+) -> ApiResult<Response> {
+    let label_selector = LabelSelector::parse(query.label_selector.as_deref())?;
+    let field_selector = FieldSelector::parse(query.field_selector.as_deref())?;
+    let subscription = state
+        .backend
+        .service_accounts
+        .watch(ServiceAccountWatchRequest {
+            namespace: Some(namespace),
+            label_selector,
+            field_selector,
+            resource_version: query.resource_version.clone(),
+            allow_bookmarks: parse_boolean(
+                query.allow_watch_bookmarks.as_deref(),
+                "allowWatchBookmarks",
+            )?,
+        })
+        .await?;
+    Ok(service_account_watch_response(subscription))
+}
+
 async fn open_pod_watch(
     state: &AppState,
     query: &ListQuery,
@@ -1454,6 +1663,33 @@ fn watch_response(subscription: ConfigMapWatchSubscription) -> Response {
     response
 }
 
+fn service_account_watch_response(subscription: ServiceAccountWatchSubscription) -> Response {
+    let event_stream = stream! {
+        let mut subscription = subscription;
+        while let Some(event) = subscription.recv().await {
+            let mut encoded = match serde_json::to_vec(&event) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    yield Err::<Bytes, io::Error>(io::Error::other(error));
+                    break;
+                }
+            };
+            encoded.push(b'\n');
+            yield Ok::<Bytes, io::Error>(Bytes::from(encoded));
+        }
+    };
+    let mut response = Response::new(Body::from_stream(event_stream));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    response
+}
+
 fn pod_watch_response(subscription: PodWatchSubscription) -> Response {
     let event_stream = stream! {
         let mut subscription = subscription;
@@ -1525,6 +1761,10 @@ fn decode_config_map(body: Bytes) -> ApiResult<ConfigMap> {
 
 fn decode_pod(body: Bytes) -> ApiResult<Pod> {
     decode_typed_resource(body, "Pod")
+}
+
+fn decode_service_account(body: Bytes) -> ApiResult<ServiceAccount> {
+    decode_typed_resource(body, "ServiceAccount")
 }
 
 fn decode_namespace(body: Bytes) -> ApiResult<Namespace> {
@@ -1645,6 +1885,43 @@ fn bind_namespace(mut resource: ConfigMap, namespace: &str) -> ApiResult<ConfigM
             resource.metadata.namespace = Some(namespace.to_owned());
             Ok(resource)
         }
+    }
+}
+
+fn bind_service_account_namespace(
+    mut resource: ServiceAccount,
+    namespace: &str,
+) -> ApiResult<ServiceAccount> {
+    match resource.metadata.namespace.as_deref() {
+        Some(body_namespace) if body_namespace != namespace => Err(ApiError::Invalid {
+            message: format!(
+                "metadata.namespace {body_namespace:?} does not match request namespace {namespace:?}"
+            ),
+        }
+        .into()),
+        _ => {
+            resource.metadata.namespace = Some(namespace.to_owned());
+            Ok(resource)
+        }
+    }
+}
+
+fn bind_service_account_update_identity(
+    resource: ServiceAccount,
+    namespace: &str,
+    name: &str,
+) -> ApiResult<ServiceAccount> {
+    let resource = bind_service_account_namespace(resource, namespace)?;
+    match resource.metadata.name.as_deref() {
+        Some(body_name) if body_name == name => Ok(resource),
+        Some(body_name) => Err(ApiError::Invalid {
+            message: format!("metadata.name {body_name:?} does not match request name {name:?}"),
+        }
+        .into()),
+        None => Err(ApiError::Invalid {
+            message: "metadata.name is required".to_owned(),
+        }
+        .into()),
     }
 }
 

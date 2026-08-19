@@ -12,6 +12,7 @@ pub const CONFIG_MAP_KIND: &str = "ConfigMap";
 pub const POD_KIND: &str = "Pod";
 pub const NAMESPACE_KIND: &str = "Namespace";
 pub const NODE_KIND: &str = "Node";
+pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -67,6 +68,20 @@ impl TypeMeta {
         Self {
             api_version: CORE_API_VERSION.to_owned(),
             kind: "NodeList".to_owned(),
+        }
+    }
+
+    pub fn service_account() -> Self {
+        Self {
+            api_version: CORE_API_VERSION.to_owned(),
+            kind: SERVICE_ACCOUNT_KIND.to_owned(),
+        }
+    }
+
+    pub fn service_account_list() -> Self {
+        Self {
+            api_version: CORE_API_VERSION.to_owned(),
+            kind: "ServiceAccountList".to_owned(),
         }
     }
 
@@ -274,6 +289,95 @@ impl ConfigMap {
         self.metadata.creation_timestamp = Some(now);
         self.metadata.generation = Some(1);
         self.metadata.resource_version = Some(resource_version);
+    }
+}
+
+/// A local name reference used by core/v1 ServiceAccount secret lists.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalObjectReference {
+    pub name: String,
+}
+
+/// Typed core/v1 ServiceAccount identity object.
+///
+/// Token issuance and secret lifecycle remain separate control-plane responsibilities. This
+/// resource persists the stable namespace/name/UID identity required by bound-token validation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAccount {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<LocalObjectReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<LocalObjectReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automount_service_account_token: Option<bool>,
+}
+
+impl ServiceAccount {
+    pub fn name(&self) -> Result<&str, ApiError> {
+        self.metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| ApiError::Invalid {
+                message: "metadata.name is required".to_owned(),
+            })
+    }
+
+    pub fn namespace(&self) -> Result<&str, ApiError> {
+        self.metadata
+            .namespace
+            .as_deref()
+            .ok_or_else(|| ApiError::Invalid {
+                message: "metadata.namespace is required".to_owned(),
+            })
+    }
+
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        enforce_type_meta(&mut self.type_meta, SERVICE_ACCOUNT_KIND)
+    }
+
+    pub fn validate(&self) -> Result<(), ApiError> {
+        validate_dns_subdomain("metadata.name", self.name()?, 253)?;
+        validate_dns_label("metadata.namespace", self.namespace()?)?;
+        validate_object_labels(&self.metadata.labels)?;
+        for reference in self.secrets.iter().chain(&self.image_pull_secrets) {
+            validate_dns_subdomain("ServiceAccount secret reference", &reference.name, 253)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_create(&self) -> Result<(), ApiError> {
+        self.validate()
+    }
+
+    pub fn validate_update(&self, previous: &Self) -> Result<(), ApiError> {
+        self.validate()?;
+        if self.name()? != previous.name()? || self.namespace()? != previous.namespace()? {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount identity is immutable".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn set_create_metadata(
+        &mut self,
+        uid: String,
+        now: OffsetDateTime,
+        resource_version: String,
+    ) {
+        self.metadata.uid = Some(uid);
+        self.metadata.creation_timestamp = Some(now);
+        self.metadata.generation = Some(1);
+        self.metadata.resource_version = Some(resource_version);
+    }
+
+    pub fn preserve_server_metadata_from(&mut self, previous: &Self, resource_version: String) {
+        preserve_server_metadata(&mut self.metadata, &previous.metadata, resource_version);
     }
 }
 
@@ -782,6 +886,28 @@ impl PodList {
     }
 }
 
+/// A typed ServiceAccount list response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ServiceAccountList {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ListMeta,
+    pub items: Vec<ServiceAccount>,
+}
+
+impl ServiceAccountList {
+    pub fn new(resource_version: String, items: Vec<ServiceAccount>) -> Self {
+        Self {
+            type_meta: TypeMeta::service_account_list(),
+            metadata: ListMeta {
+                resource_version: Some(resource_version),
+            },
+            items,
+        }
+    }
+}
+
 /// A typed Namespace list response.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NamespaceList {
@@ -980,6 +1106,52 @@ impl ConfigMapWatchEvent {
         Self {
             event_type: WatchEventType::Error,
             object: ConfigMapWatchObject::Status(status),
+        }
+    }
+}
+
+/// The object carried by a typed ServiceAccount watch event.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum ServiceAccountWatchObject {
+    ServiceAccount(ServiceAccount),
+    Status(ApiStatus),
+}
+
+/// Kubernetes JSON WATCH event envelope for ServiceAccount.
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceAccountWatchEvent {
+    #[serde(rename = "type")]
+    pub event_type: WatchEventType,
+    pub object: ServiceAccountWatchObject,
+}
+
+impl ServiceAccountWatchEvent {
+    pub fn added(resource: ServiceAccount) -> Self {
+        Self {
+            event_type: WatchEventType::Added,
+            object: ServiceAccountWatchObject::ServiceAccount(resource),
+        }
+    }
+
+    pub fn modified(resource: ServiceAccount) -> Self {
+        Self {
+            event_type: WatchEventType::Modified,
+            object: ServiceAccountWatchObject::ServiceAccount(resource),
+        }
+    }
+
+    pub fn deleted(resource: ServiceAccount) -> Self {
+        Self {
+            event_type: WatchEventType::Deleted,
+            object: ServiceAccountWatchObject::ServiceAccount(resource),
+        }
+    }
+
+    pub fn bookmark(resource_version: String) -> Self {
+        Self {
+            event_type: WatchEventType::Bookmark,
+            object: ServiceAccountWatchObject::Status(ApiStatus::success(resource_version)),
         }
     }
 }
@@ -1223,6 +1395,10 @@ impl FieldSelector {
     }
 
     pub fn matches_pod(&self, resource: &Pod) -> bool {
+        self.matches_metadata(&resource.metadata)
+    }
+
+    pub fn matches_service_account(&self, resource: &ServiceAccount) -> bool {
         self.matches_metadata(&resource.metadata)
     }
 

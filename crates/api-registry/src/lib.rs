@@ -159,6 +159,14 @@ impl ApiRegistry {
                     subresources: &[],
                 },
                 ResourceStrategy {
+                    plural: "serviceaccounts",
+                    singular: "serviceaccount",
+                    kind: "ServiceAccount",
+                    scope: ResourceScope::Namespaced,
+                    verbs: &["create", "delete", "get", "list", "update", "watch"],
+                    subresources: &[],
+                },
+                ResourceStrategy {
                     plural: "nodes",
                     singular: "node",
                     kind: "Node",
@@ -325,7 +333,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 5);
+        assert_eq!(discovery.resources.len(), 6);
         assert!(discovery
             .resources
             .iter()
@@ -334,6 +342,10 @@ mod tests {
             .resources
             .iter()
             .any(|resource| resource.name == "pods" && resource.namespaced));
+        assert!(discovery
+            .resources
+            .iter()
+            .any(|resource| resource.name == "serviceaccounts" && resource.namespaced));
         assert!(discovery
             .resources
             .iter()
@@ -381,6 +393,13 @@ mod tests {
             .expect("namespaced Pod collection resolves");
         assert_eq!(pod_collection.resource.kind, "Pod");
         assert_eq!(pod_collection.namespace.as_deref(), Some("development"));
+
+        let service_account = registry
+            .resolve_core_v1_path("/api/v1/namespaces/development/serviceaccounts/build-robot")
+            .expect("namespaced ServiceAccount path resolves");
+        assert_eq!(service_account.resource.kind, "ServiceAccount");
+        assert_eq!(service_account.namespace.as_deref(), Some("development"));
+        assert_eq!(service_account.name.as_deref(), Some("build-robot"));
     }
 
     #[test]
