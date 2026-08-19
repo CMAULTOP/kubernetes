@@ -16,6 +16,7 @@ reqwest.workspace = true
 rusternetes-api-server = { path = "../crates/api-server" }
 rusternetes-api-types = { path = "../crates/api-types" }
 rusternetes-authn = { path = "../crates/authn" }
+rusternetes-authz-rbac = { path = "../crates/authz-rbac" }
 rusternetes-common = { path = "../crates/common" }
 rusternetes-storage = { path = "../crates/storage" }
 rusternetes-storage-etcd = { path = "../crates/storage-etcd" }

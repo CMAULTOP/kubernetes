@@ -12,6 +12,7 @@ axum.workspace = true
 http.workspace = true
 rusternetes-api-types = { path = "../api-types" }
 rusternetes-authn = { path = "../authn" }
+rusternetes-authz-rbac = { path = "../authz-rbac" }
 rusternetes-common = { path = "../common" }
 rusternetes-storage = { path = "../storage" }
 rusternetes-storage-etcd = { path = "../storage-etcd" }

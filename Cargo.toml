@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/authn",
+    "crates/authz-rbac",
     "crates/api-types",
     "crates/storage",
     "crates/storage-etcd",

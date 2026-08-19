@@ -18,6 +18,8 @@ pub enum StatusReason {
     Conflict,
     #[serde(rename = "Expired")]
     Expired,
+    #[serde(rename = "Forbidden")]
+    Forbidden,
     #[serde(rename = "InternalError")]
     InternalError,
     #[serde(rename = "Invalid")]
@@ -69,6 +71,8 @@ pub enum ApiError {
     BadRequest { message: String },
     #[error("the object has been modified; please apply your changes to the latest version and try again")]
     Conflict { resource: ResourceReference },
+    #[error("forbidden: {message}")]
+    Forbidden { message: String },
     #[error("invalid ConfigMap: {message}")]
     Invalid { message: String },
     #[error("resource version has expired: {message}")]
@@ -89,6 +93,7 @@ impl ApiError {
             Self::AlreadyExists { .. } => StatusReason::AlreadyExists,
             Self::BadRequest { .. } => StatusReason::BadRequest,
             Self::Conflict { .. } => StatusReason::Conflict,
+            Self::Forbidden { .. } => StatusReason::Forbidden,
             Self::Invalid { .. } => StatusReason::Invalid,
             Self::ResourceExpired { .. } => StatusReason::Expired,
             Self::NotFound { .. } => StatusReason::NotFound,
@@ -102,6 +107,7 @@ impl ApiError {
         match self {
             Self::AlreadyExists { .. } | Self::Conflict { .. } => 409,
             Self::BadRequest { .. } | Self::Invalid { .. } => 400,
+            Self::Forbidden { .. } => 403,
             Self::ResourceExpired { .. } => 410,
             Self::NotFound { .. } => 404,
             Self::Unauthorized { .. } => 401,
@@ -116,6 +122,7 @@ impl ApiError {
             | Self::Conflict { resource }
             | Self::NotFound { resource } => Some(resource),
             Self::BadRequest { .. }
+            | Self::Forbidden { .. }
             | Self::Invalid { .. }
             | Self::ResourceExpired { .. }
             | Self::Unauthorized { .. }

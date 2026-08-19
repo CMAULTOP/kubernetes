@@ -8,9 +8,12 @@ use std::{
     time::Duration,
 };
 
-use rusternetes_api_server::{router_with_backend_and_auth, ConfigMapBackend};
+use rusternetes_api_server::{
+    router_with_backend_auth_and_authorization, AuthorizationMode, ConfigMapBackend,
+};
 use rusternetes_api_types::{ApiStatus, ConfigMap, ConfigMapList, ObjectMeta, TypeMeta};
 use rusternetes_authn::{AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken};
+use rusternetes_authz_rbac::{PolicyRule, RbacAuthorizer, Role, RoleBinding, RoleRef, Subject};
 use rusternetes_common::StatusReason;
 use rusternetes_storage_etcd::EtcdConfigMapRepository;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -109,14 +112,26 @@ async fn start_server_with_auth(
     repository: Arc<EtcdConfigMapRepository>,
     authentication: AuthenticationChain,
 ) -> TestServer {
+    start_server_with_authorization(repository, authentication, AuthorizationMode::AlwaysAllow)
+        .await
+}
+
+async fn start_server_with_authorization(
+    repository: Arc<EtcdConfigMapRepository>,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
+) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|error| panic!("HTTP listener binds: {error}"));
     let address = listener
         .local_addr()
         .unwrap_or_else(|error| panic!("HTTP listener reports address: {error}"));
-    let application =
-        router_with_backend_and_auth(ConfigMapBackend::Etcd(repository), authentication);
+    let application = router_with_backend_auth_and_authorization(
+        ConfigMapBackend::Etcd(repository),
+        authentication,
+        authorization,
+    );
     let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, application).await {
             panic!("etcd-backed API Server fails: {error}");
@@ -403,4 +418,81 @@ async fn http_api_enforces_configured_bearer_authentication_before_etcd_mutation
         .await
         .unwrap_or_else(|error| panic!("invalid bearer request completes: {error}"));
     assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn http_rbac_allows_only_bound_namespace_after_authentication() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-http-rbac/{}", Uuid::new_v4());
+    let repository = Arc::new(
+        EtcdConfigMapRepository::connect([endpoint.as_str()], Some(&prefix))
+            .await
+            .expect("etcd repository connects"),
+    );
+    let identity = RequestIdentity::authenticated(
+        "namespace-editor",
+        None,
+        std::iter::empty(),
+        Default::default(),
+    )
+    .expect("identity is valid");
+    let token = StaticBearerToken::new("editor-secret", identity).expect("token is valid");
+    let policy = RbacAuthorizer::new(
+        vec![Role {
+            namespace: "development".to_owned(),
+            name: "configmap-editor".to_owned(),
+            rules: vec![PolicyRule {
+                api_groups: vec![String::new()],
+                resources: vec!["configmaps".to_owned()],
+                verbs: vec!["create".to_owned(), "get".to_owned(), "list".to_owned()],
+                ..PolicyRule::default()
+            }],
+        }],
+        Vec::new(),
+        vec![RoleBinding {
+            namespace: "development".to_owned(),
+            name: "editor-binding".to_owned(),
+            subjects: vec![Subject::User("namespace-editor".to_owned())],
+            role_ref: RoleRef::Role("configmap-editor".to_owned()),
+        }],
+        Vec::new(),
+    );
+    let server = start_server_with_authorization(
+        repository.clone(),
+        AuthenticationChain::new(AnonymousPolicy::Deny, vec![token]),
+        AuthorizationMode::Rbac(policy),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let allowed = client
+        .post(format!(
+            "{}/api/v1/namespaces/development/configmaps",
+            server.base_url
+        ))
+        .header("authorization", "Bearer editor-secret")
+        .json(&config_map("settings", "development", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("bound namespace request completes: {error}"));
+    assert_eq!(allowed.status(), reqwest::StatusCode::CREATED);
+    assert!(repository.get("development", "settings").await.is_ok());
+
+    let denied = client
+        .post(format!(
+            "{}/api/v1/namespaces/production/configmaps",
+            server.base_url
+        ))
+        .header("authorization", "Bearer editor-secret")
+        .json(&config_map("settings", "production", "api"))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("unbound namespace request completes: {error}"));
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    let status: ApiStatus = denied
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("403 response is Kubernetes Status: {error}"));
+    assert_eq!(status.reason, StatusReason::Forbidden);
+    assert!(repository.get("production", "settings").await.is_err());
 }

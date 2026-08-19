@@ -888,6 +888,7 @@ dependencies = [
  "http",
  "rusternetes-api-types",
  "rusternetes-authn",
+ "rusternetes-authz-rbac",
  "rusternetes-common",
  "rusternetes-storage",
  "rusternetes-storage-etcd",
@@ -917,6 +918,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-authz-rbac"
+version = "0.1.0"
+dependencies = [
+ "rusternetes-authn",
+ "rusternetes-common",
+]
+
+[[package]]
 name = "rusternetes-common"
 version = "0.1.0"
 dependencies = [
@@ -936,6 +945,7 @@ dependencies = [
  "rusternetes-api-server",
  "rusternetes-api-types",
  "rusternetes-authn",
+ "rusternetes-authz-rbac",
  "rusternetes-common",
  "rusternetes-storage",
  "rusternetes-storage-etcd",

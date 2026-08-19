@@ -16,7 +16,8 @@ use rusternetes_api_types::{
     core_api_versions, core_v1_resources, ApiStatus, ConfigMap, DeleteOptions, FieldSelector,
     LabelSelector,
 };
-use rusternetes_authn::AuthenticationChain;
+use rusternetes_authn::{AuthenticationChain, RequestIdentity};
+use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
     ConfigMapWatchRequest, ConfigMapWatchSubscription as InMemoryConfigMapWatchSubscription,
@@ -149,10 +150,36 @@ pub fn router_with_backend(backend: ConfigMapBackend) -> Router {
     router_with_backend_and_auth(backend, AuthenticationChain::default())
 }
 
+/// Authorization configuration used by the API Server after authentication succeeds.
+#[derive(Clone, Debug, Default)]
+pub enum AuthorizationMode {
+    /// Development compatibility mode. Production callers should select [`Self::Rbac`].
+    #[default]
+    AlwaysAllow,
+    /// Fail-closed Kubernetes RBAC policy evaluation.
+    Rbac(RbacAuthorizer),
+}
+
 /// Builds the API Server router with explicit storage and authentication implementations.
 pub fn router_with_backend_and_auth(
     backend: ConfigMapBackend,
     authentication: AuthenticationChain,
+) -> Router {
+    router_with_backend_auth_and_authorization(
+        backend,
+        authentication,
+        AuthorizationMode::default(),
+    )
+}
+
+/// Builds the API Server router with explicit storage, authentication, and authorization layers.
+///
+/// Middleware order is fixed: credentials establish `RequestIdentity`, RBAC evaluates that identity
+/// and normalized request attributes, then the resource handler may execute.
+pub fn router_with_backend_auth_and_authorization(
+    backend: ConfigMapBackend,
+    authentication: AuthenticationChain,
+    authorization: AuthorizationMode,
 ) -> Router {
     let state = AppState::new(backend);
     Router::new()
@@ -171,6 +198,12 @@ pub fn router_with_backend_and_auth(
                 .delete(delete_config_map),
         )
         .fallback(not_found)
+        // Axum applies the last layer first. Authentication must populate extensions before RBAC
+        // evaluates them, so authorization is added before authentication here.
+        .layer(middleware::from_fn_with_state(
+            authorization,
+            authorize_request,
+        ))
         .layer(middleware::from_fn_with_state(
             authentication,
             authenticate_request,
@@ -233,6 +266,88 @@ async fn authenticate_request(
         }
         Err(error) => ApiRejection(error).into_response(),
     }
+}
+
+async fn authorize_request(
+    State(authorization): State<AuthorizationMode>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match authorization {
+        AuthorizationMode::AlwaysAllow => next.run(request).await,
+        AuthorizationMode::Rbac(authorizer) => {
+            let Some(identity) = request.extensions().get::<RequestIdentity>() else {
+                return ApiRejection(ApiError::Forbidden {
+                    message: "request reached authorization without an authenticated identity"
+                        .to_owned(),
+                })
+                .into_response();
+            };
+            let attributes = authorization_request_from_http(request.method(), request.uri());
+            if authorizer.authorize(identity, &attributes) {
+                next.run(request).await
+            } else {
+                ApiRejection(ApiError::Forbidden {
+                    message: "RBAC policy does not allow this request".to_owned(),
+                })
+                .into_response()
+            }
+        }
+    }
+}
+
+fn authorization_request_from_http(
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+) -> AuthorizationRequest {
+    let segments = uri
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["api", "v1", "configmaps"] => config_map_request(method, uri.query(), None, None),
+        ["api", "v1", "namespaces", namespace, "configmaps"] => {
+            config_map_request(method, uri.query(), Some((*namespace).to_owned()), None)
+        }
+        ["api", "v1", "namespaces", namespace, "configmaps", name] => config_map_request(
+            method,
+            uri.query(),
+            Some((*namespace).to_owned()),
+            Some((*name).to_owned()),
+        ),
+        _ => AuthorizationRequest::non_resource(
+            method.as_str().to_ascii_lowercase(),
+            uri.path().to_owned(),
+        ),
+    }
+}
+
+fn config_map_request(
+    method: &axum::http::Method,
+    query: Option<&str>,
+    namespace: Option<String>,
+    name: Option<String>,
+) -> AuthorizationRequest {
+    let collection = name.is_none();
+    let watch = query.is_some_and(|query| {
+        query
+            .split('&')
+            .any(|item| matches!(item, "watch=true" | "watch=1"))
+    });
+    let verb = match method.as_str() {
+        "POST" => "create",
+        "PUT" => "update",
+        "PATCH" => "patch",
+        "DELETE" if collection => "deletecollection",
+        "DELETE" => "delete",
+        "GET" | "HEAD" if watch => "watch",
+        "GET" | "HEAD" if collection => "list",
+        "GET" | "HEAD" => "get",
+        other => other,
+    };
+    AuthorizationRequest::resource(verb, "", "configmaps", None, namespace, name)
 }
 
 /// A local response wrapper makes the API error representation available to Axum without
