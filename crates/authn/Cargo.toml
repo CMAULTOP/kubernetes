@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+jsonwebtoken.workspace = true
+serde.workspace = true
 rusternetes-common = { path = "../common" }
 subtle.workspace = true
 

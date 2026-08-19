@@ -21,7 +21,7 @@ use rusternetes_api_types::{
     ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
     Node, Pod, ServiceAccount,
 };
-use rusternetes_authn::{AuthenticationChain, RequestIdentity};
+use rusternetes_authn::{AuthenticationChain, RequestIdentity, VerifiedServiceAccountJwt};
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
 use rusternetes_storage::{
@@ -586,6 +586,12 @@ impl AppState {
     }
 }
 
+#[derive(Clone)]
+struct AuthenticationState {
+    chain: AuthenticationChain,
+    service_accounts: ServiceAccountBackend,
+}
+
 /// Builds an API Server router using the current in-memory development backend.
 pub fn router(store: Arc<InMemoryConfigMapStore>) -> Router {
     router_with_backend(ConfigMapBackend::InMemory(store))
@@ -669,6 +675,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         authorization,
         admission,
     );
+    let authentication_state = AuthenticationState {
+        chain: authentication,
+        service_accounts: state.backend.service_accounts.clone(),
+    };
     Router::new()
         .route("/version", get(version))
         .route("/api", get(api_versions))
@@ -733,7 +743,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             authorize_request,
         ))
         .layer(middleware::from_fn_with_state(
-            authentication,
+            authentication_state,
             authenticate_request,
         ))
         .with_state(state)
@@ -863,7 +873,7 @@ async fn ensure_default_namespace(backend: &NamespaceBackend) -> Result<(), ApiE
 }
 
 async fn authenticate_request(
-    State(authentication): State<AuthenticationChain>,
+    State(authentication): State<AuthenticationState>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -879,13 +889,57 @@ async fn authenticate_request(
         },
         None => None,
     };
-    match authentication.authenticate(authorization) {
+    let identity = match authentication.chain.authenticate(authorization) {
+        Ok(identity) => Ok(identity),
+        Err(static_error) => match authentication
+            .chain
+            .verify_service_account_jwt(authorization)
+        {
+            Ok(Some(claims)) => {
+                authenticate_live_service_account(&authentication.service_accounts, claims).await
+            }
+            Ok(None) | Err(_) => Err(static_error),
+        },
+    };
+    match identity {
         Ok(identity) => {
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
         Err(error) => ApiRejection(error).into_response(),
     }
+}
+
+async fn authenticate_live_service_account(
+    backend: &ServiceAccountBackend,
+    claims: VerifiedServiceAccountJwt,
+) -> Result<RequestIdentity, ApiError> {
+    let namespace = claims.kubernetes.namespace;
+    let name = claims.kubernetes.service_account.name;
+    let expected_uid = claims.kubernetes.service_account.uid;
+    let resource = backend
+        .get(&namespace, &name)
+        .await
+        .map_err(|error| match error {
+            ApiError::NotFound { .. } => ApiError::Unauthorized {
+                message: "ServiceAccount JWT refers to a missing ServiceAccount".to_owned(),
+            },
+            other => other,
+        })?;
+    if resource.metadata.uid.as_deref() != Some(expected_uid.as_str()) {
+        return Err(ApiError::Unauthorized {
+            message: "ServiceAccount JWT UID does not match the current ServiceAccount".to_owned(),
+        });
+    }
+    RequestIdentity::authenticated(
+        format!("system:serviceaccount:{namespace}:{name}"),
+        Some(expected_uid),
+        [
+            "system:serviceaccounts".to_owned(),
+            format!("system:serviceaccounts:{namespace}"),
+        ],
+        Default::default(),
+    )
 }
 
 async fn authorize_request(
@@ -2025,6 +2079,7 @@ mod tests {
         http::Request,
         routing::get,
     };
+    use rusternetes_api_types::{ObjectMeta, TypeMeta};
     use rusternetes_authn::{
         AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken,
     };
@@ -2032,6 +2087,61 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn live_service_account_identity_requires_current_matching_uid() {
+        let store = Arc::new(InMemoryServiceAccountStore::new());
+        let backend = ServiceAccountBackend::InMemory(store.clone());
+        let created = store
+            .create(ServiceAccount {
+                type_meta: TypeMeta::service_account(),
+                metadata: ObjectMeta {
+                    name: Some("build-robot".to_owned()),
+                    namespace: Some("default".to_owned()),
+                    ..ObjectMeta::default()
+                },
+                ..ServiceAccount::default()
+            })
+            .await
+            .expect("ServiceAccount creates");
+        let uid = created.metadata.uid.expect("server assigns UID");
+        let claims = || VerifiedServiceAccountJwt {
+            iss: "https://issuer.example".to_owned(),
+            sub: "system:serviceaccount:default:build-robot".to_owned(),
+            aud: vec!["api".to_owned()],
+            kubernetes: rusternetes_authn::KubernetesServiceAccountClaims {
+                namespace: "default".to_owned(),
+                service_account: rusternetes_authn::KubernetesServiceAccountIdentityClaims {
+                    name: "build-robot".to_owned(),
+                    uid: uid.clone(),
+                },
+            },
+        };
+        let identity = authenticate_live_service_account(&backend, claims())
+            .await
+            .expect("current ServiceAccount UID is accepted");
+        assert_eq!(
+            identity.username,
+            "system:serviceaccount:default:build-robot"
+        );
+        assert!(identity.groups.contains("system:serviceaccounts"));
+        assert!(identity.groups.contains("system:serviceaccounts:default"));
+
+        let mut stale = claims();
+        stale.kubernetes.service_account.uid = "recreated-uid".to_owned();
+        assert!(matches!(
+            authenticate_live_service_account(&backend, stale).await,
+            Err(ApiError::Unauthorized { .. })
+        ));
+        store
+            .delete("default", "build-robot", DeleteOptions::default())
+            .await
+            .expect("ServiceAccount deletes");
+        assert!(matches!(
+            authenticate_live_service_account(&backend, claims()).await,
+            Err(ApiError::Unauthorized { .. })
+        ));
+    }
 
     #[test]
     fn node_status_path_maps_to_a_distinct_rbac_subresource() {
@@ -2137,7 +2247,12 @@ mod tests {
         Router::new()
             .route("/identity", get(identity_handler))
             .layer(middleware::from_fn_with_state(
-                authentication,
+                AuthenticationState {
+                    chain: authentication,
+                    service_accounts: ServiceAccountBackend::InMemory(Arc::new(
+                        InMemoryServiceAccountStore::new(),
+                    )),
+                },
                 authenticate_request,
             ))
     }
