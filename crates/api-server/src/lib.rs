@@ -590,6 +590,8 @@ impl AppState {
 struct AuthenticationState {
     chain: AuthenticationChain,
     service_accounts: ServiceAccountBackend,
+    pods: PodBackend,
+    nodes: NodeBackend,
 }
 
 /// Builds an API Server router using the current in-memory development backend.
@@ -678,6 +680,8 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
     let authentication_state = AuthenticationState {
         chain: authentication,
         service_accounts: state.backend.service_accounts.clone(),
+        pods: state.backend.pods.clone(),
+        nodes: state.backend.nodes.clone(),
     };
     Router::new()
         .route("/version", get(version))
@@ -896,7 +900,13 @@ async fn authenticate_request(
             .verify_service_account_jwt(authorization)
         {
             Ok(Some(claims)) => {
-                authenticate_live_service_account(&authentication.service_accounts, claims).await
+                authenticate_live_service_account(
+                    &authentication.service_accounts,
+                    &authentication.pods,
+                    &authentication.nodes,
+                    claims,
+                )
+                .await
             }
             Ok(None) | Err(_) => Err(static_error),
         },
@@ -912,9 +922,13 @@ async fn authenticate_request(
 
 async fn authenticate_live_service_account(
     backend: &ServiceAccountBackend,
+    pods: &PodBackend,
+    nodes: &NodeBackend,
     claims: VerifiedServiceAccountJwt,
 ) -> Result<RequestIdentity, ApiError> {
     let namespace = claims.kubernetes.namespace;
+    let pod_claim = claims.kubernetes.pod;
+    let node_claim = claims.kubernetes.node;
     let name = claims.kubernetes.service_account.name;
     let expected_uid = claims.kubernetes.service_account.uid;
     let resource = backend
@@ -930,6 +944,34 @@ async fn authenticate_live_service_account(
         return Err(ApiError::Unauthorized {
             message: "ServiceAccount JWT UID does not match the current ServiceAccount".to_owned(),
         });
+    }
+    if let Some(pod) = pod_claim {
+        let resource = pods
+            .get(&namespace, &pod.name)
+            .await
+            .map_err(|error| match error {
+                ApiError::NotFound { .. } => ApiError::Unauthorized {
+                    message: "ServiceAccount JWT refers to a missing bound Pod".to_owned(),
+                },
+                other => other,
+            })?;
+        if resource.metadata.uid.as_deref() != Some(pod.uid.as_str()) {
+            return Err(ApiError::Unauthorized {
+                message: "ServiceAccount JWT UID does not match the current bound Pod".to_owned(),
+            });
+        }
+    } else if let Some(node) = node_claim {
+        let resource = nodes.get(&node.name).await.map_err(|error| match error {
+            ApiError::NotFound { .. } => ApiError::Unauthorized {
+                message: "ServiceAccount JWT refers to a missing bound Node".to_owned(),
+            },
+            other => other,
+        })?;
+        if resource.metadata.uid.as_deref() != Some(node.uid.as_str()) {
+            return Err(ApiError::Unauthorized {
+                message: "ServiceAccount JWT UID does not match the current bound Node".to_owned(),
+            });
+        }
     }
     RequestIdentity::authenticated(
         format!("system:serviceaccount:{namespace}:{name}"),
@@ -2079,7 +2121,7 @@ mod tests {
         http::Request,
         routing::get,
     };
-    use rusternetes_api_types::{ObjectMeta, TypeMeta};
+    use rusternetes_api_types::{Container, Node, ObjectMeta, Pod, PodSpec, TypeMeta};
     use rusternetes_authn::{
         AnonymousPolicy, AuthenticationChain, RequestIdentity, StaticBearerToken,
     };
@@ -2092,6 +2134,10 @@ mod tests {
     async fn live_service_account_identity_requires_current_matching_uid() {
         let store = Arc::new(InMemoryServiceAccountStore::new());
         let backend = ServiceAccountBackend::InMemory(store.clone());
+        let pod_store = Arc::new(InMemoryPodStore::new());
+        let pods = PodBackend::InMemory(pod_store.clone());
+        let node_store = Arc::new(InMemoryNodeStore::new());
+        let nodes = NodeBackend::InMemory(node_store.clone());
         let created = store
             .create(ServiceAccount {
                 type_meta: TypeMeta::service_account(),
@@ -2115,9 +2161,11 @@ mod tests {
                     name: "build-robot".to_owned(),
                     uid: uid.clone(),
                 },
+                pod: None,
+                node: None,
             },
         };
-        let identity = authenticate_live_service_account(&backend, claims())
+        let identity = authenticate_live_service_account(&backend, &pods, &nodes, claims())
             .await
             .expect("current ServiceAccount UID is accepted");
         assert_eq!(
@@ -2127,10 +2175,80 @@ mod tests {
         assert!(identity.groups.contains("system:serviceaccounts"));
         assert!(identity.groups.contains("system:serviceaccounts:default"));
 
+        let bound_pod = pods
+            .create(Pod {
+                type_meta: TypeMeta::pod(),
+                metadata: ObjectMeta {
+                    name: Some("worker-pod".to_owned()),
+                    namespace: Some("default".to_owned()),
+                    ..ObjectMeta::default()
+                },
+                spec: PodSpec {
+                    containers: vec![Container {
+                        name: "main".to_owned(),
+                        ..Container::default()
+                    }],
+                    ..PodSpec::default()
+                },
+                ..Pod::default()
+            })
+            .await
+            .expect("Pod creates");
+        let mut pod_bound = claims();
+        pod_bound.kubernetes.pod = Some(rusternetes_authn::KubernetesBoundObjectClaims {
+            name: "worker-pod".to_owned(),
+            uid: bound_pod.metadata.uid.clone().expect("Pod gets UID"),
+        });
+        // Kubernetes includes Node metadata with Pod-bound tokens but does not validate it at
+        // token authentication time; the Pod UID remains the live revocation object.
+        pod_bound.kubernetes.node = Some(rusternetes_authn::KubernetesBoundObjectClaims {
+            name: "unrelated-node".to_owned(),
+            uid: "nonexistent-node-uid".to_owned(),
+        });
+        authenticate_live_service_account(&backend, &pods, &nodes, pod_bound.clone())
+            .await
+            .expect("current Pod-bound token is accepted without Node lookup");
+        pod_store
+            .delete("default", "worker-pod", DeleteOptions::default())
+            .await
+            .expect("Pod deletes");
+        assert!(matches!(
+            authenticate_live_service_account(&backend, &pods, &nodes, pod_bound).await,
+            Err(ApiError::Unauthorized { .. })
+        ));
+
+        let bound_node = nodes
+            .create(Node {
+                type_meta: TypeMeta::node(),
+                metadata: ObjectMeta {
+                    name: Some("worker-a".to_owned()),
+                    ..ObjectMeta::default()
+                },
+                ..Node::default()
+            })
+            .await
+            .expect("Node creates");
+        let mut node_bound = claims();
+        node_bound.kubernetes.node = Some(rusternetes_authn::KubernetesBoundObjectClaims {
+            name: "worker-a".to_owned(),
+            uid: bound_node.metadata.uid.clone().expect("Node gets UID"),
+        });
+        authenticate_live_service_account(&backend, &pods, &nodes, node_bound.clone())
+            .await
+            .expect("current direct Node-bound token is accepted");
+        node_store
+            .delete("worker-a", DeleteOptions::default())
+            .await
+            .expect("Node deletes");
+        assert!(matches!(
+            authenticate_live_service_account(&backend, &pods, &nodes, node_bound).await,
+            Err(ApiError::Unauthorized { .. })
+        ));
+
         let mut stale = claims();
         stale.kubernetes.service_account.uid = "recreated-uid".to_owned();
         assert!(matches!(
-            authenticate_live_service_account(&backend, stale).await,
+            authenticate_live_service_account(&backend, &pods, &nodes, stale).await,
             Err(ApiError::Unauthorized { .. })
         ));
         store
@@ -2138,7 +2256,7 @@ mod tests {
             .await
             .expect("ServiceAccount deletes");
         assert!(matches!(
-            authenticate_live_service_account(&backend, claims()).await,
+            authenticate_live_service_account(&backend, &pods, &nodes, claims()).await,
             Err(ApiError::Unauthorized { .. })
         ));
     }
@@ -2252,6 +2370,8 @@ mod tests {
                     service_accounts: ServiceAccountBackend::InMemory(Arc::new(
                         InMemoryServiceAccountStore::new(),
                     )),
+                    pods: PodBackend::InMemory(Arc::new(InMemoryPodStore::new())),
+                    nodes: NodeBackend::InMemory(Arc::new(InMemoryNodeStore::new())),
                 },
                 authenticate_request,
             ))

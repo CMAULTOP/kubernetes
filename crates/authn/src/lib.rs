@@ -90,10 +90,21 @@ pub struct KubernetesServiceAccountClaims {
     pub namespace: String,
     #[serde(rename = "serviceaccount")]
     pub service_account: KubernetesServiceAccountIdentityClaims,
+    #[serde(default)]
+    pub pod: Option<KubernetesBoundObjectClaims>,
+    #[serde(default)]
+    pub node: Option<KubernetesBoundObjectClaims>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct KubernetesServiceAccountIdentityClaims {
+    pub name: String,
+    pub uid: String,
+}
+
+/// Name and UID claim for a Pod- or Node-bound ServiceAccount token.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct KubernetesBoundObjectClaims {
     pub name: String,
     pub uid: String,
 }
@@ -172,7 +183,19 @@ fn validate_service_account_claims(
         "system:serviceaccount:{}:{}",
         claims.kubernetes.namespace, claims.kubernetes.service_account.name
     );
-    if claims.sub != expected_subject || claims.kubernetes.service_account.uid.is_empty() {
+    if claims.sub != expected_subject
+        || claims.kubernetes.service_account.uid.is_empty()
+        || claims
+            .kubernetes
+            .pod
+            .as_ref()
+            .is_some_and(|pod| pod.name.is_empty() || pod.uid.is_empty())
+        || claims
+            .kubernetes
+            .node
+            .as_ref()
+            .is_some_and(|node| node.name.is_empty() || node.uid.is_empty())
+    {
         return Err(unauthorized(
             "ServiceAccount JWT identity claims are inconsistent",
         ));
