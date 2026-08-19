@@ -739,6 +739,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             "/api/v1/namespaces/:name",
             get(get_namespace)
                 .put(replace_namespace)
+                .patch(patch_namespace)
                 .delete(delete_namespace),
         )
         .route(
@@ -1738,6 +1739,23 @@ async fn replace_namespace(
     Ok(Json(state.backend.namespaces.update(resource).await?))
 }
 
+async fn patch_namespace(
+    State(state): State<AppState>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Namespace>> {
+    let current = state.backend.namespaces.get(&name).await?;
+    let patched = bind_namespace_update_identity(
+        apply_namespace_patch(current.clone(), &headers, body)?,
+        &name,
+    )?;
+    let admission_request = AdmissionRequest::namespace_update(identity, patched.clone(), current)?;
+    state.admission.validate(&admission_request).await?;
+    Ok(Json(state.backend.namespaces.update(patched).await?))
+}
+
 async fn get_namespace_status(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -2194,6 +2212,50 @@ fn decode_node(body: Bytes) -> ApiResult<Node> {
 enum NodePatchFormat {
     JsonPatch,
     MergePatch,
+}
+
+fn apply_namespace_patch(
+    current: Namespace,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> ApiResult<Namespace> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a Namespace PATCH request body is required".to_owned(),
+        }
+        .into());
+    }
+    let mut document = serde_json::to_value(current).map_err(|_| ApiError::Internal)?;
+    match node_patch_format(headers)? {
+        NodePatchFormat::JsonPatch => {
+            let patch: json_patch::Patch =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Patch document: {error}"),
+                })?;
+            json_patch::patch(&mut document, &patch).map_err(|error| ApiError::Invalid {
+                message: format!("JSON Patch could not be applied: {error}"),
+            })?;
+        }
+        NodePatchFormat::MergePatch => {
+            let patch: Value =
+                serde_json::from_slice(&body).map_err(|error| ApiError::BadRequest {
+                    message: format!("invalid JSON Merge Patch document: {error}"),
+                })?;
+            if !patch.is_object() {
+                return Err(ApiError::BadRequest {
+                    message: "JSON Merge Patch document must be an object".to_owned(),
+                }
+                .into());
+            }
+            json_patch::merge(&mut document, &patch);
+        }
+    }
+    serde_json::from_value(document).map_err(|error| {
+        ApiError::Invalid {
+            message: format!("PATCH result is not a valid Namespace: {error}"),
+        }
+        .into()
+    })
 }
 
 fn apply_pod_patch(current: Pod, headers: &HeaderMap, body: Bytes) -> ApiResult<Pod> {
@@ -3135,6 +3197,116 @@ mod tests {
                 Request::builder()
                     .method("PATCH")
                     .uri("/api/v1/namespaces/default/pods/patch-pod")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "metadata": { "resourceVersion": created.metadata.resource_version,
+                                          "labels": { "stale": "true" } }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn namespace_patch_preserves_finalizer_and_status_invariants() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": { "name": "patch-development" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created: Namespace = serde_json::from_slice(
+            &to_bytes(create.into_body(), usize::MAX)
+                .await
+                .expect("create body is readable"),
+        )
+        .expect("created Namespace is JSON");
+
+        let merged_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/patch-development")
+                    .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                    .body(Body::from(r#"{"metadata":{"labels":{"patched":"true"}}}"#))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(merged_response.status(), StatusCode::OK);
+        let merged: Namespace = serde_json::from_slice(
+            &to_bytes(merged_response.into_body(), usize::MAX)
+                .await
+                .expect("merge response is readable"),
+        )
+        .expect("merged Namespace is JSON");
+        assert_eq!(
+            merged.metadata.labels.get("patched"),
+            Some(&"true".to_owned())
+        );
+
+        let json_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/patch-development")
+                    .header(header::CONTENT_TYPE, "application/json-patch+json")
+                    .body(Body::from(
+                        r#"[{"op":"add","path":"/metadata/labels/json-patched","value":"true"}]"#,
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(json_response.status(), StatusCode::OK);
+
+        for body in [
+            r#"{"spec":{"finalizers":["forbidden"]}}"#,
+            r#"{"status":{"phase":"Terminating"}}"#,
+            r#"{"metadata":{"name":"different"}}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/v1/namespaces/patch-development")
+                        .header(header::CONTENT_TYPE, "application/merge-patch+json")
+                        .body(Body::from(body))
+                        .expect("valid request"),
+                )
+                .await
+                .expect("router is infallible");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let stale_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/patch-development")
                     .header(header::CONTENT_TYPE, "application/merge-patch+json")
                     .body(Body::from(
                         serde_json::json!({
