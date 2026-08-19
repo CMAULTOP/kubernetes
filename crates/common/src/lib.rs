@@ -61,6 +61,15 @@ impl ResourceReference {
         }
     }
 
+    pub fn node(name: impl Into<String>) -> Self {
+        Self {
+            group: String::new(),
+            resource: "nodes".to_owned(),
+            namespace: None,
+            name: Some(name.into()),
+        }
+    }
+
     pub fn namespace(name: impl Into<String>) -> Self {
         Self {
             group: String::new(),

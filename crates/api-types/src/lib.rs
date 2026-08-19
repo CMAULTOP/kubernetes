@@ -11,6 +11,7 @@ pub const CORE_API_VERSION: &str = "v1";
 pub const CONFIG_MAP_KIND: &str = "ConfigMap";
 pub const POD_KIND: &str = "Pod";
 pub const NAMESPACE_KIND: &str = "Namespace";
+pub const NODE_KIND: &str = "Node";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -52,6 +53,20 @@ impl TypeMeta {
         Self {
             api_version: CORE_API_VERSION.to_owned(),
             kind: "PodList".to_owned(),
+        }
+    }
+
+    pub fn node() -> Self {
+        Self {
+            api_version: CORE_API_VERSION.to_owned(),
+            kind: NODE_KIND.to_owned(),
+        }
+    }
+
+    pub fn node_list() -> Self {
+        Self {
+            api_version: CORE_API_VERSION.to_owned(),
+            kind: "NodeList".to_owned(),
         }
     }
 
@@ -476,6 +491,78 @@ impl Pod {
     pub fn preserve_server_metadata_from(&mut self, previous: &Self, resource_version: String) {
         preserve_server_metadata(&mut self.metadata, &previous.metadata, resource_version);
         self.status = previous.status.clone();
+    }
+}
+
+/// Minimal self-registration desired state retained before full Node API support.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeSpec {
+    #[serde(default)]
+    pub unschedulable: bool,
+}
+
+/// Server-owned health summary for the initial Node registration contract.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeStatus {
+    #[serde(default)]
+    pub ready: bool,
+}
+
+/// Typed cluster-scoped core/v1 Node registration object.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Node {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: NodeSpec,
+    #[serde(default)]
+    pub status: NodeStatus,
+}
+
+impl Node {
+    pub fn name(&self) -> Result<&str, ApiError> {
+        self.metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| ApiError::Invalid {
+                message: "metadata.name is required".to_owned(),
+            })
+    }
+
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        enforce_type_meta(&mut self.type_meta, NODE_KIND)
+    }
+
+    pub fn validate_registration(&self) -> Result<(), ApiError> {
+        validate_dns_subdomain("metadata.name", self.name()?, 253)?;
+        if self.metadata.namespace.is_some() {
+            return Err(ApiError::Invalid {
+                message: "Node is cluster-scoped and metadata.namespace must be empty".to_owned(),
+            });
+        }
+        validate_object_labels(&self.metadata.labels)?;
+        if self.status.ready {
+            return Err(ApiError::Invalid {
+                message: "Node status is server-owned during registration".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn set_registration_metadata(
+        &mut self,
+        uid: String,
+        now: OffsetDateTime,
+        resource_version: String,
+    ) {
+        self.metadata.uid = Some(uid);
+        self.metadata.creation_timestamp = Some(now);
+        self.metadata.generation = Some(1);
+        self.metadata.resource_version = Some(resource_version);
+        self.status.ready = true;
     }
 }
 

@@ -11,6 +11,7 @@ members = [
     "crates/storage-etcd",
     "crates/controller-runtime",
     "crates/scheduler",
+    "crates/node-runtime",
     "crates/api-server",
     "integration-tests",
 ]

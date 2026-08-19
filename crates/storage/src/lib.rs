@@ -15,7 +15,9 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
+mod node;
 mod pod_namespace;
+pub use node::InMemoryNodeStore;
 pub use pod_namespace::{
     InMemoryNamespaceStore, InMemoryPodStore, NamespaceWatchRequest, NamespaceWatchSubscription,
     PodWatchRequest, PodWatchSubscription,
