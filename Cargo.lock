@@ -954,6 +954,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-controller-runtime"
+version = "0.1.0"
+dependencies = [
+ "etcd-client",
+ "rusternetes-common",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rusternetes-integration-tests"
 version = "0.1.0"
 dependencies = [
@@ -968,6 +982,7 @@ dependencies = [
  "rusternetes-authn",
  "rusternetes-authz-rbac",
  "rusternetes-common",
+ "rusternetes-controller-runtime",
  "rusternetes-storage",
  "rusternetes-storage-etcd",
  "serde_json",

@@ -19,6 +19,7 @@ rusternetes-api-types = { path = "../crates/api-types" }
 rusternetes-authn = { path = "../crates/authn" }
 rusternetes-authz-rbac = { path = "../crates/authz-rbac" }
 rusternetes-common = { path = "../crates/common" }
+rusternetes-controller-runtime = { path = "../crates/controller-runtime" }
 rusternetes-storage = { path = "../crates/storage" }
 rusternetes-storage-etcd = { path = "../crates/storage-etcd" }
 serde_json.workspace = true

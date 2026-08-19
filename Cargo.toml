@@ -9,6 +9,7 @@ members = [
     "crates/api-types",
     "crates/storage",
     "crates/storage-etcd",
+    "crates/controller-runtime",
     "crates/api-server",
     "integration-tests",
 ]
