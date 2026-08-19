@@ -197,12 +197,20 @@ impl ApiRegistry {
                     kind: "Namespace",
                     scope: ResourceScope::Cluster,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[SubresourceStrategy {
-                        name: "status",
-                        discovery_name: "namespaces/status",
-                        kind: "Namespace",
-                        verbs: &["get", "update"],
-                    }],
+                    subresources: &[
+                        SubresourceStrategy {
+                            name: "status",
+                            discovery_name: "namespaces/status",
+                            kind: "Namespace",
+                            verbs: &["get", "update"],
+                        },
+                        SubresourceStrategy {
+                            name: "finalize",
+                            discovery_name: "namespaces/finalize",
+                            kind: "Namespace",
+                            verbs: &["update"],
+                        },
+                    ],
                 },
             ],
         }])
@@ -282,15 +290,30 @@ impl ApiRegistry {
                     None,
                 )
             }
-            ["api", "v1", "namespaces", namespace, plural] => {
-                let resource = resolve(plural)?;
-                (
-                    resource.clone(),
-                    matches!(resource.scope, ResourceScope::Namespaced)
-                        .then(|| (*namespace).to_owned()),
-                    None,
-                    None,
-                )
+            ["api", "v1", "namespaces", namespace_or_name, final_segment] => {
+                let namespace_resource = resolve("namespaces")?;
+                if let Some(subresource) = namespace_resource
+                    .subresources
+                    .iter()
+                    .find(|strategy| strategy.name == *final_segment)
+                {
+                    (
+                        namespace_resource.clone(),
+                        None,
+                        matches!(namespace_resource.scope, ResourceScope::Cluster)
+                            .then(|| (*namespace_or_name).to_owned()),
+                        Some(subresource.name),
+                    )
+                } else {
+                    let resource = resolve(final_segment)?;
+                    (
+                        resource.clone(),
+                        matches!(resource.scope, ResourceScope::Namespaced)
+                            .then(|| (*namespace_or_name).to_owned()),
+                        None,
+                        None,
+                    )
+                }
             }
             ["api", "v1", "namespaces", namespace, plural, name] => {
                 let resource = resolve(plural)?;
@@ -362,7 +385,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 9);
+        assert_eq!(discovery.resources.len(), 10);
         assert!(discovery
             .resources
             .iter()
@@ -416,6 +439,18 @@ mod tests {
         assert_eq!(namespace.resource.kind, "Namespace");
         assert_eq!(namespace.namespace, None);
         assert_eq!(namespace.name.as_deref(), Some("development"));
+        let namespace_finalize = registry
+            .resolve_core_v1_path("/api/v1/namespaces/development/finalize")
+            .expect("cluster-scoped Namespace finalize path resolves");
+        assert_eq!(namespace_finalize.resource.kind, "Namespace");
+        assert_eq!(namespace_finalize.name.as_deref(), Some("development"));
+        assert_eq!(namespace_finalize.subresource, Some("finalize"));
+        assert!(discovery.resources.iter().any(|resource| {
+            resource.name == "namespaces/finalize"
+                && !resource.namespaced
+                && resource.kind == "Namespace"
+                && resource.verbs == ["update"]
+        }));
 
         let pod_collection = registry
             .resolve_core_v1_path("/api/v1/namespaces/development/pods")

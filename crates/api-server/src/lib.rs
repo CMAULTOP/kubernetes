@@ -9,7 +9,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
     Json, Router,
 };
 use rusternetes_admission::{
@@ -396,6 +396,13 @@ impl NamespaceBackend {
         }
     }
 
+    async fn finalize(&self, resource: Namespace) -> Result<Namespace, ApiError> {
+        match self {
+            Self::InMemory(store) => store.finalize(resource).await,
+            Self::Etcd(repository) => repository.finalize(resource).await,
+        }
+    }
+
     async fn delete(&self, name: &str, options: DeleteOptions) -> Result<DeleteResult, ApiError> {
         match self {
             Self::InMemory(store) => store.delete(name, options).await,
@@ -746,6 +753,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
             "/api/v1/namespaces/:name/status",
             get(get_namespace_status).put(replace_namespace_status),
         )
+        .route("/api/v1/namespaces/:name/finalize", put(finalize_namespace))
         .route(
             "/api/v1/namespaces/:namespace/configmaps",
             get(list_config_maps).post(create_config_map),
@@ -1756,6 +1764,15 @@ async fn patch_namespace(
     Ok(Json(state.backend.namespaces.update(patched).await?))
 }
 
+async fn finalize_namespace(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<Namespace>> {
+    let resource = bind_namespace_update_identity(decode_namespace(body)?, &name)?;
+    Ok(Json(state.backend.namespaces.finalize(resource).await?))
+}
+
 async fn get_namespace_status(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1779,16 +1796,27 @@ async fn delete_namespace(
     Extension(identity): Extension<RequestIdentity>,
     Path(name): Path<String>,
     body: Bytes,
-) -> ApiResult<Json<ApiStatus>> {
+) -> ApiResult<Response> {
     let options = decode_delete_options(body)?;
     let old_object = state.backend.namespaces.get(&name).await?;
+    let deletion_is_pending = old_object.metadata.deletion_timestamp.is_none()
+        && (!old_object.metadata.finalizers.is_empty() || !old_object.spec.finalizers.is_empty());
     let admission_request = AdmissionRequest::namespace_delete(identity, old_object)?;
     state.admission.validate(&admission_request).await?;
     let result = state.backend.namespaces.delete(&name, options).await?;
-    Ok(Json(ApiStatus::success(format!(
-        "namespaces {name:?} deleted at resourceVersion {}",
-        result.resource_version
-    ))))
+    let status = if deletion_is_pending {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(ApiStatus::success(format!(
+            "namespaces {name:?} deletion accepted at resourceVersion {}",
+            result.resource_version
+        ))),
+    )
+        .into_response())
 }
 
 async fn list_nodes(
@@ -3210,6 +3238,93 @@ mod tests {
             .await
             .expect("router is infallible");
         assert_eq!(stale_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn namespace_delete_waits_for_finalize_and_then_removes_the_object() {
+        let app = router(Arc::new(InMemoryConfigMapStore::new()));
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Namespace",
+                            "metadata": { "name": "terminating-development" },
+                            "spec": { "finalizers": ["example.com/cleanup"] }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/namespaces/terminating-development")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(delete.status(), StatusCode::ACCEPTED);
+
+        let pending_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/namespaces/terminating-development")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(pending_response.status(), StatusCode::OK);
+        let mut pending: Namespace = serde_json::from_slice(
+            &to_bytes(pending_response.into_body(), usize::MAX)
+                .await
+                .expect("pending Namespace body is readable"),
+        )
+        .expect("pending Namespace is JSON");
+        assert!(pending.metadata.deletion_timestamp.is_some());
+        assert_eq!(pending.status.phase, Some(NamespacePhase::Terminating));
+
+        pending.spec.finalizers.clear();
+        let finalize = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/terminating-development/finalize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&pending).expect("finalize Namespace serializes"),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(finalize.status(), StatusCode::OK);
+
+        let after_finalize = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/namespaces/terminating-development")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(after_finalize.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

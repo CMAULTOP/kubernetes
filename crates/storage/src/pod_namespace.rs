@@ -639,8 +639,16 @@ impl InMemoryNamespaceStore {
         resource.validate_update(&previous)?;
         let resource_version = state.next_resource_version();
         resource.preserve_server_metadata_from(&previous, resource_version);
-        let event = NamespaceWatchEvent::modified(resource.clone());
-        state.namespaces.insert(name, resource.clone());
+        let deletion_completed = previous.metadata.deletion_timestamp.is_some()
+            && resource.metadata.finalizers.is_empty()
+            && resource.spec.finalizers.is_empty();
+        let event = if deletion_completed {
+            state.namespaces.remove(&name);
+            NamespaceWatchEvent::deleted(resource.clone())
+        } else {
+            state.namespaces.insert(name, resource.clone());
+            NamespaceWatchEvent::modified(resource.clone())
+        };
         let revision = state.revision;
         state.publish(NamespaceHistoryEvent {
             revision,
@@ -684,6 +692,47 @@ impl InMemoryNamespaceStore {
         Ok(resource)
     }
 
+    /// Applies the dedicated Namespace `/finalize` transition under the shared resourceVersion.
+    pub async fn finalize(&self, mut resource: Namespace) -> Result<Namespace, ApiError> {
+        self.drain_closed_watchers().await;
+        resource.enforce_type_meta()?;
+        let name = resource.name()?.to_owned();
+        let reference = ResourceReference::namespace(name.clone());
+        let requested_version = resource.metadata.resource_version.clone();
+        let mut state = self.state.write().await;
+        let previous = state
+            .namespaces
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound {
+                resource: reference.clone(),
+            })?;
+        verify_update_version(
+            requested_version.as_deref(),
+            previous.metadata.resource_version.as_deref(),
+            &reference,
+        )?;
+        resource.validate_finalize_update(&previous)?;
+        let resource_version = state.next_resource_version();
+        resource.preserve_finalize_update_from(&previous, resource_version);
+        let deletion_completed =
+            resource.metadata.finalizers.is_empty() && resource.spec.finalizers.is_empty();
+        let event = if deletion_completed {
+            state.namespaces.remove(&name);
+            NamespaceWatchEvent::deleted(resource.clone())
+        } else {
+            state.namespaces.insert(name, resource.clone());
+            NamespaceWatchEvent::modified(resource.clone())
+        };
+        let revision = state.revision;
+        state.publish(NamespaceHistoryEvent {
+            revision,
+            resource: resource.clone(),
+            event,
+        });
+        Ok(resource)
+    }
+
     pub async fn delete(
         &self,
         name: &str,
@@ -700,7 +749,27 @@ impl InMemoryNamespaceStore {
                 .ok_or_else(|| ApiError::NotFound {
                     resource: reference.clone(),
                 })?;
-        validate_delete(&current.metadata, &options, &reference)?;
+        validate_delete_preconditions(&current.metadata, &options, &reference)?;
+        if current.metadata.deletion_timestamp.is_none()
+            && (!current.metadata.finalizers.is_empty() || !current.spec.finalizers.is_empty())
+        {
+            let resource_version = state.next_resource_version();
+            current.mark_deletion_requested(OffsetDateTime::now_utc(), resource_version.clone());
+            let event = NamespaceWatchEvent::modified(current.clone());
+            state.namespaces.insert(name.to_owned(), current.clone());
+            let revision = state.revision;
+            state.publish(NamespaceHistoryEvent {
+                revision,
+                resource: current,
+                event,
+            });
+            return Ok(DeleteResult { resource_version });
+        }
+        if current.metadata.deletion_timestamp.is_some() {
+            return Ok(DeleteResult {
+                resource_version: current.metadata.resource_version.unwrap_or_default(),
+            });
+        }
         state.namespaces.remove(name);
         let resource_version = state.next_resource_version();
         current.metadata.resource_version = Some(resource_version.clone());
@@ -807,6 +876,14 @@ fn validate_delete(
             message: "deleting resources with finalizers is not implemented in phase 1".to_owned(),
         });
     }
+    validate_delete_preconditions(metadata, options, reference)
+}
+
+fn validate_delete_preconditions(
+    metadata: &rusternetes_api_types::ObjectMeta,
+    options: &DeleteOptions,
+    reference: &ResourceReference,
+) -> Result<(), ApiError> {
     if let Some(preconditions) = &options.preconditions {
         if preconditions.uid.is_some() && preconditions.uid != metadata.uid
             || preconditions.resource_version.is_some()
@@ -990,6 +1067,62 @@ mod tests {
                 .await,
             Err(ApiError::Conflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn namespace_finalizer_delete_is_staged_and_finalize_completes_it() {
+        let store = InMemoryNamespaceStore::new();
+        let mut resource = namespace("terminating");
+        resource
+            .spec
+            .finalizers
+            .push("example.com/cleanup".to_owned());
+        let created = store.create(resource).await.expect("Namespace creates");
+        let mut watch = store
+            .watch(NamespaceWatchRequest {
+                resource_version: created.metadata.resource_version.clone(),
+                ..NamespaceWatchRequest::default()
+            })
+            .await
+            .expect("watch starts");
+
+        store
+            .delete("terminating", DeleteOptions::default())
+            .await
+            .expect("deletion request stages the Namespace");
+        let pending = store
+            .get("terminating")
+            .await
+            .expect("Namespace remains visible");
+        assert!(pending.metadata.deletion_timestamp.is_some());
+        assert_eq!(pending.status.phase, Some(NamespacePhase::Terminating));
+        assert_eq!(
+            watch
+                .recv()
+                .await
+                .expect("deletion request is watched")
+                .event_type,
+            WatchEventType::Modified
+        );
+
+        let mut finalize = pending.clone();
+        finalize.spec.finalizers.clear();
+        store
+            .finalize(finalize)
+            .await
+            .expect("removing final finalizer completes deletion");
+        assert!(matches!(
+            store.get("terminating").await,
+            Err(ApiError::NotFound { .. })
+        ));
+        assert_eq!(
+            watch
+                .recv()
+                .await
+                .expect("completed deletion is watched")
+                .event_type,
+            WatchEventType::Deleted
+        );
     }
 
     #[tokio::test]

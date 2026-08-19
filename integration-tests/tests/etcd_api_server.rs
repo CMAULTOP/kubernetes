@@ -849,6 +849,72 @@ async fn http_core_backend_persists_pods_in_real_etcd_without_memory_fallback() 
 }
 
 #[tokio::test]
+async fn namespace_finalizer_lifecycle_persists_through_configured_etcd_backend() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let root = format!(
+        "/rusternetes-namespace-finalizer-http-tests/{}",
+        Uuid::new_v4()
+    );
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&root))
+        .await
+        .expect("durable core backend initializes");
+    let repository =
+        EtcdNamespaceRepository::connect([endpoint.as_str()], Some(&format!("{root}/namespaces")))
+            .await
+            .expect("direct Namespace etcd repository connects");
+    let server = start_core_server(backend).await;
+    let client = reqwest::Client::new();
+    let mut resource = namespace("terminating-development");
+    resource
+        .spec
+        .finalizers
+        .push("example.com/cleanup".to_owned());
+    let created_response = client
+        .post(format!("{}/api/v1/namespaces", server.base_url))
+        .json(&resource)
+        .send()
+        .await
+        .expect("Namespace create completes");
+    assert_eq!(created_response.status(), reqwest::StatusCode::CREATED);
+
+    let delete_response = client
+        .delete(format!(
+            "{}/api/v1/namespaces/terminating-development",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("Namespace deletion request completes");
+    assert_eq!(delete_response.status(), reqwest::StatusCode::ACCEPTED);
+    let pending = repository
+        .get("terminating-development")
+        .await
+        .expect("deletion-pending Namespace is durable");
+    assert!(pending.metadata.deletion_timestamp.is_some());
+    assert_eq!(
+        pending.status.phase,
+        Some(rusternetes_api_types::NamespacePhase::Terminating)
+    );
+
+    let mut finalize = pending.clone();
+    finalize.spec.finalizers.clear();
+    let finalize_response = client
+        .put(format!(
+            "{}/api/v1/namespaces/terminating-development/finalize",
+            server.base_url
+        ))
+        .json(&finalize)
+        .send()
+        .await
+        .expect("Namespace finalization completes");
+    assert_eq!(finalize_response.status(), reqwest::StatusCode::OK);
+    assert!(matches!(
+        repository.get("terminating-development").await,
+        Err(rusternetes_common::ApiError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn namespace_status_persists_through_configured_etcd_backend_without_spec_mutation() {
     let (_etcd, endpoint) = start_etcd().await;
     let root = format!(

@@ -136,6 +136,12 @@ pub struct ObjectMeta {
         with = "time::serde::rfc3339::option"
     )]
     pub creation_timestamp: Option<OffsetDateTime>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub deletion_timestamp: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -995,7 +1001,76 @@ impl Namespace {
                 message: "status is server-owned; use the future /status subresource".to_owned(),
             });
         }
+        if previous.metadata.deletion_timestamp.is_some()
+            && (self.metadata.deletion_timestamp != previous.metadata.deletion_timestamp
+                || self.metadata.finalizers.len() > previous.metadata.finalizers.len()
+                || self
+                    .metadata
+                    .finalizers
+                    .iter()
+                    .any(|finalizer| !previous.metadata.finalizers.contains(finalizer)))
+        {
+            return Err(ApiError::Invalid {
+                message:
+                    "a deletion-pending Namespace can only remove existing metadata.finalizers"
+                        .to_owned(),
+            });
+        }
         Ok(())
+    }
+
+    /// Marks a Namespace as deletion-pending without allowing callers to choose the timestamp.
+    pub fn mark_deletion_requested(&mut self, now: OffsetDateTime, resource_version: String) {
+        if self.metadata.deletion_timestamp.is_none() {
+            self.metadata.deletion_timestamp = Some(now);
+            self.status.phase = Some(NamespacePhase::Terminating);
+            self.metadata.resource_version = Some(resource_version);
+        }
+    }
+
+    /// Validates the dedicated `/finalize` transition after deletion has been requested.
+    /// Namespace `spec.finalizers` can only lose existing entries; all other fields remain
+    /// server-owned for this transition.
+    pub fn validate_finalize_update(&self, previous: &Self) -> Result<(), ApiError> {
+        self.validate()?;
+        if previous.metadata.deletion_timestamp.is_none() {
+            return Err(ApiError::Invalid {
+                message: "Namespace finalization requires metadata.deletionTimestamp".to_owned(),
+            });
+        }
+        if self.metadata.deletion_timestamp != previous.metadata.deletion_timestamp {
+            return Err(ApiError::Invalid {
+                message: "metadata.deletionTimestamp is immutable once set".to_owned(),
+            });
+        }
+        if self.status != previous.status {
+            return Err(ApiError::Invalid {
+                message: "Namespace finalization cannot modify server-owned status".to_owned(),
+            });
+        }
+        if self.spec.finalizers.len() > previous.spec.finalizers.len()
+            || self
+                .spec
+                .finalizers
+                .iter()
+                .any(|finalizer| !previous.spec.finalizers.contains(finalizer))
+        {
+            return Err(ApiError::Invalid {
+                message: "Namespace finalization can only remove existing spec.finalizers"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn preserve_finalize_update_from(&mut self, previous: &Self, resource_version: String) {
+        let finalizers = self.spec.finalizers.clone();
+        self.type_meta = previous.type_meta.clone();
+        self.metadata = previous.metadata.clone();
+        self.metadata.resource_version = Some(resource_version);
+        self.spec = previous.spec.clone();
+        self.spec.finalizers = finalizers;
+        self.status = previous.status.clone();
     }
 
     pub fn set_create_metadata(
@@ -1695,6 +1770,7 @@ fn preserve_server_metadata(
 ) {
     target.uid = previous.uid.clone();
     target.creation_timestamp = previous.creation_timestamp;
+    target.deletion_timestamp = previous.deletion_timestamp;
     target.generation = previous.generation;
     target.resource_version = Some(resource_version);
 }
