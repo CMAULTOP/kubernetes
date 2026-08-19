@@ -21,6 +21,7 @@ rusternetes-storage = { path = "../storage" }
 rusternetes-storage-etcd = { path = "../storage-etcd" }
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

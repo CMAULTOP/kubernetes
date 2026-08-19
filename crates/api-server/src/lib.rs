@@ -19,11 +19,12 @@ use rusternetes_admission::{
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
     ApiStatus, ConfigMap, DeleteOptions, FieldSelector, LabelSelector, Namespace, NamespacePhase,
-    Node, Pod, ServiceAccount,
+    Node, Pod, ServiceAccount, TokenRequest,
 };
 use rusternetes_authn::{
-    AuthenticationChain, RequestIdentity, ServiceAccountJwksDocument, ServiceAccountOidcDiscovery,
-    ServiceAccountOidcDiscoveryDocument, VerifiedServiceAccountJwt,
+    AuthenticationChain, KubernetesBoundObjectClaims, RequestIdentity, ServiceAccountJwksDocument,
+    ServiceAccountOidcDiscovery, ServiceAccountOidcDiscoveryDocument, ServiceAccountTokenIssuer,
+    ServiceAccountTokenSubject, VerifiedServiceAccountJwt,
 };
 use rusternetes_authz_rbac::{AuthorizationRequest, RbacAuthorizer};
 use rusternetes_common::{ApiError, ResourceReference};
@@ -44,6 +45,7 @@ use rusternetes_storage_etcd::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
 
 /// The ConfigMap persistence implementation selected when building an API Server router.
 ///
@@ -562,6 +564,7 @@ pub struct AppState {
     registry: ApiRegistry,
     authorization: AuthorizationMode,
     admission: AdmissionChain,
+    service_account_token_issuer: Option<ServiceAccountTokenIssuer>,
     service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
 }
 
@@ -586,6 +589,7 @@ impl AppState {
             registry,
             authorization,
             admission,
+            service_account_token_issuer: None,
             service_account_oidc_discovery: None,
         }
     }
@@ -682,6 +686,7 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         authorization,
         admission,
     );
+    state.service_account_token_issuer = authentication.service_account_token_issuer().cloned();
     state.service_account_oidc_discovery = authentication.service_account_oidc_discovery().cloned();
     let authentication_state = AuthenticationState {
         chain: authentication,
@@ -750,6 +755,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
                 .put(replace_service_account)
                 .delete(delete_service_account),
         )
+        .route(
+            "/api/v1/namespaces/:namespace/serviceaccounts/:name/token",
+            axum::routing::post(create_service_account_token),
+        )
         .fallback(not_found)
         // Axum applies the last layer first. Authentication must populate extensions before RBAC
         // evaluates them, so authorization is added before authentication here.
@@ -767,10 +776,19 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
 /// Builds a router over all typed core/v1 backends with a lifecycle admission reader bound to the
 /// same Namespace repository.
 pub fn router_with_core_backend(backend: CoreApiBackend) -> Router {
+    router_with_core_backend_and_auth(backend, AuthenticationChain::default())
+}
+
+/// Builds a router over all typed core/v1 backends with lifecycle admission and explicit
+/// authentication configuration, including a validated optional ServiceAccount TokenRequest issuer.
+pub fn router_with_core_backend_and_auth(
+    backend: CoreApiBackend,
+    authentication: AuthenticationChain,
+) -> Router {
     let admission = namespace_lifecycle_admission(backend.namespaces.clone());
     router_with_core_backend_auth_authorization_and_admission(
         backend,
-        AuthenticationChain::default(),
+        authentication,
         AuthorizationMode::default(),
         admission,
     )
@@ -1337,6 +1355,144 @@ async fn replace_service_account(
     let resource =
         bind_service_account_update_identity(decode_service_account(body)?, &namespace, &name)?;
     Ok(Json(state.backend.service_accounts.update(resource).await?))
+}
+
+async fn create_service_account_token(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<TokenRequest>> {
+    let mut request = decode_token_request(body)?;
+    request.enforce_type_meta()?;
+    request.validate_spec()?;
+    let issuer =
+        state
+            .service_account_token_issuer
+            .as_ref()
+            .ok_or_else(|| ApiError::BadRequest {
+                message: "ServiceAccount TokenRequest signing is not configured".to_owned(),
+            })?;
+    let service_account = state
+        .backend
+        .service_accounts
+        .get(&namespace, &name)
+        .await?;
+    let service_account_uid = service_account
+        .metadata
+        .uid
+        .clone()
+        .ok_or(ApiError::Internal)?;
+    if request
+        .metadata
+        .uid
+        .as_deref()
+        .is_some_and(|uid| uid != service_account_uid)
+    {
+        return Err(ApiError::Invalid {
+            message: "metadata.uid does not match the live ServiceAccount UID".to_owned(),
+        }
+        .into());
+    }
+    let (pod, node) = token_request_bound_claims(&state, &namespace, &request).await?;
+    let issued = issuer.issue(
+        ServiceAccountTokenSubject {
+            namespace,
+            service_account_name: name,
+            service_account_uid,
+            pod,
+            node,
+        },
+        &request.spec.audiences,
+        request.spec.expiration_seconds,
+        OffsetDateTime::now_utc(),
+    )?;
+    request.status.token = issued.token;
+    request.status.expiration_timestamp = Some(issued.expiration_timestamp);
+    Ok(Json(request))
+}
+
+async fn token_request_bound_claims(
+    state: &AppState,
+    namespace: &str,
+    request: &TokenRequest,
+) -> ApiResult<(
+    Option<KubernetesBoundObjectClaims>,
+    Option<KubernetesBoundObjectClaims>,
+)> {
+    let Some(reference) = &request.spec.bound_object_ref else {
+        return Ok((None, None));
+    };
+    match (reference.api_version.as_str(), reference.kind.as_str()) {
+        ("v1", "Pod") => {
+            let pod = state.backend.pods.get(namespace, &reference.name).await?;
+            validate_token_request_bound_uid(
+                "Pod",
+                &reference.name,
+                &reference.uid,
+                pod.metadata.uid.as_deref(),
+            )?;
+            let pod_claim = KubernetesBoundObjectClaims {
+                name: reference.name.clone(),
+                uid: reference.uid.clone(),
+            };
+            let node_claim = match pod.spec.node_name.as_deref() {
+                Some(node_name) => match state.backend.nodes.get(node_name).await {
+                    Ok(node) if node.metadata.uid.is_some() => Some(KubernetesBoundObjectClaims {
+                        name: node_name.to_owned(),
+                        uid: node.metadata.uid.expect("checked above"),
+                    }),
+                    Ok(_) => return Err(ApiError::Internal.into()),
+                    Err(ApiError::NotFound { .. }) => None,
+                    Err(error) => return Err(error.into()),
+                },
+                None => None,
+            };
+            Ok((Some(pod_claim), node_claim))
+        }
+        ("v1", "Node") => {
+            let node = state.backend.nodes.get(&reference.name).await?;
+            validate_token_request_bound_uid(
+                "Node",
+                &reference.name,
+                &reference.uid,
+                node.metadata.uid.as_deref(),
+            )?;
+            Ok((
+                None,
+                Some(KubernetesBoundObjectClaims {
+                    name: reference.name.clone(),
+                    uid: reference.uid.clone(),
+                }),
+            ))
+        }
+        ("v1", "Secret") => Err(ApiError::Invalid {
+            message:
+                "Secret-bound TokenRequest is unavailable until Secret live validation is active"
+                    .to_owned(),
+        }
+        .into()),
+        _ => Err(ApiError::Invalid {
+            message:
+                "spec.boundObjectRef supports only core/v1 Pod or Node in this control-plane slice"
+                    .to_owned(),
+        }
+        .into()),
+    }
+}
+
+fn validate_token_request_bound_uid(
+    kind: &str,
+    name: &str,
+    requested_uid: &str,
+    current_uid: Option<&str>,
+) -> ApiResult<()> {
+    if current_uid != Some(requested_uid) {
+        return Err(ApiError::Invalid {
+            message: format!("spec.boundObjectRef {kind} {name:?} UID does not match live object"),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 async fn delete_service_account(
@@ -1917,6 +2073,15 @@ fn decode_pod(body: Bytes) -> ApiResult<Pod> {
     decode_typed_resource(body, "Pod")
 }
 
+fn decode_token_request(body: Bytes) -> ApiResult<TokenRequest> {
+    serde_json::from_slice(&body).map_err(|error| {
+        ApiError::BadRequest {
+            message: format!("invalid TokenRequest JSON: {error}"),
+        }
+        .into()
+    })
+}
+
 fn decode_service_account(body: Bytes) -> ApiResult<ServiceAccount> {
     decode_typed_resource(body, "ServiceAccount")
 }
@@ -2248,6 +2413,189 @@ mod tests {
             .await
             .expect("router is infallible");
         assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn token_request_authentication() -> (AuthenticationChain, ServiceAccountJwtVerifier) {
+        const PRIVATE_KEY: &str = include_str!("../testdata/tokenrequest-test-private.pem");
+        const PUBLIC_KEY: &str = include_str!("../testdata/tokenrequest-test-public.pem");
+        let verifier = ServiceAccountJwtVerifier::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            vec![ServiceAccountJwtKey {
+                key_id: Some("tokenrequest-test".to_owned()),
+                rsa_public_key_pem: PUBLIC_KEY.to_owned(),
+            }],
+        )
+        .expect("test verifier is valid");
+        let issuer = ServiceAccountTokenIssuer::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            PRIVATE_KEY,
+            "tokenrequest-test",
+            60,
+            120,
+        )
+        .expect("test issuer is valid");
+        let identity = RequestIdentity::authenticated(
+            "bootstrap-admin",
+            None,
+            ["system:masters".to_owned()],
+            Default::default(),
+        )
+        .expect("test identity is valid");
+        let authentication = AuthenticationChain::new(
+            AnonymousPolicy::Deny,
+            vec![StaticBearerToken::new("bootstrap-secret", identity).expect("test token")],
+        )
+        .with_service_account_jwt_verifier(verifier.clone())
+        .with_service_account_token_issuer(issuer)
+        .expect("issuer matches verifier");
+        (authentication, verifier)
+    }
+
+    async fn configured_token_request_app() -> (Router, ServiceAccountJwtVerifier) {
+        let config_maps = Arc::new(InMemoryConfigMapStore::new());
+        let service_accounts = Arc::new(InMemoryServiceAccountStore::new());
+        let created = service_accounts
+            .create(ServiceAccount {
+                type_meta: TypeMeta::service_account(),
+                metadata: ObjectMeta {
+                    name: Some("build-robot".to_owned()),
+                    namespace: Some("default".to_owned()),
+                    ..ObjectMeta::default()
+                },
+                ..ServiceAccount::default()
+            })
+            .await
+            .expect("ServiceAccount creates");
+        assert!(created.metadata.uid.is_some());
+        let backend = CoreApiBackend {
+            config_maps: ConfigMapBackend::InMemory(config_maps),
+            pods: PodBackend::InMemory(Arc::new(InMemoryPodStore::new())),
+            service_accounts: ServiceAccountBackend::InMemory(service_accounts),
+            namespaces: NamespaceBackend::InMemory(Arc::new(InMemoryNamespaceStore::new())),
+            nodes: NodeBackend::InMemory(Arc::new(InMemoryNodeStore::new())),
+        };
+        let (authentication, verifier) = token_request_authentication();
+        (
+            router_with_core_backend_and_auth(backend, authentication),
+            verifier,
+        )
+    }
+
+    #[tokio::test]
+    async fn token_request_issues_verifiable_service_account_jwt() {
+        let (app, verifier) = configured_token_request_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/serviceaccounts/build-robot/token")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenRequest",
+                            "spec": { "audiences": ["api"], "expirationSeconds": 3600 }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body is readable"),
+        )
+        .expect("response is JSON");
+        assert_eq!(body["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(body["kind"], "TokenRequest");
+        let token = body["status"]["token"]
+            .as_str()
+            .expect("status token is populated");
+        assert!(body["status"]["expirationTimestamp"].is_string());
+        let claims = verifier.verify(token).expect("issued token verifies");
+        assert_eq!(claims.sub, "system:serviceaccount:default:build-robot");
+        assert_eq!(claims.aud, ["api"]);
+    }
+
+    #[tokio::test]
+    async fn token_request_fails_closed_without_configured_signer() {
+        let app = router_with_backend(ConfigMapBackend::InMemory(Arc::new(
+            InMemoryConfigMapStore::new(),
+        )));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/serviceaccounts/build-robot/token")
+                    .body(Body::from("{}"))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_request_rejects_missing_bound_pod() {
+        let (app, _) = configured_token_request_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/serviceaccounts/build-robot/token")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenRequest",
+                            "spec": {
+                                "boundObjectRef": {
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "name": "does-not-exist",
+                                    "uid": "wrong-uid"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn token_request_rejects_service_account_metadata_uid_mismatch() {
+        let (app, _) = configured_token_request_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/serviceaccounts/build-robot/token")
+                    .header(header::AUTHORIZATION, "Bearer bootstrap-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authentication.k8s.io/v1",
+                            "kind": "TokenRequest",
+                            "metadata": { "uid": "stale-service-account-uid" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

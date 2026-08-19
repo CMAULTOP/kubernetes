@@ -13,6 +13,8 @@ pub const POD_KIND: &str = "Pod";
 pub const NAMESPACE_KIND: &str = "Namespace";
 pub const NODE_KIND: &str = "Node";
 pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
+pub const AUTHENTICATION_V1_API_VERSION: &str = "authentication.k8s.io/v1";
+pub const TOKEN_REQUEST_KIND: &str = "TokenRequest";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -103,6 +105,13 @@ impl TypeMeta {
         Self {
             api_version: CORE_API_VERSION.to_owned(),
             kind: "Status".to_owned(),
+        }
+    }
+
+    pub fn token_request() -> Self {
+        Self {
+            api_version: AUTHENTICATION_V1_API_VERSION.to_owned(),
+            kind: TOKEN_REQUEST_KIND.to_owned(),
         }
     }
 }
@@ -296,6 +305,135 @@ impl ConfigMap {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalObjectReference {
     pub name: String,
+}
+
+/// A create-only authentication.k8s.io/v1 ServiceAccount token issuance request.
+///
+/// The object is deliberately not persistent. The API server validates the request against live
+/// object identities and returns a populated status response.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRequest {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: TokenRequestSpec,
+    #[serde(default, skip_serializing_if = "TokenRequestStatus::is_empty")]
+    pub status: TokenRequestStatus,
+}
+
+impl TokenRequest {
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        if !self.type_meta.api_version.is_empty()
+            && self.type_meta.api_version != AUTHENTICATION_V1_API_VERSION
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "apiVersion must be {AUTHENTICATION_V1_API_VERSION}, got {}",
+                    self.type_meta.api_version
+                ),
+            });
+        }
+        if !self.type_meta.kind.is_empty() && self.type_meta.kind != TOKEN_REQUEST_KIND {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "kind must be {TOKEN_REQUEST_KIND}, got {}",
+                    self.type_meta.kind
+                ),
+            });
+        }
+        self.type_meta = TypeMeta::token_request();
+        Ok(())
+    }
+
+    pub fn validate_spec(&self) -> Result<(), ApiError> {
+        if self
+            .spec
+            .audiences
+            .iter()
+            .any(|audience| audience.is_empty())
+        {
+            return Err(ApiError::Invalid {
+                message: "spec.audiences must not contain empty values".to_owned(),
+            });
+        }
+        if self
+            .spec
+            .expiration_seconds
+            .is_some_and(|seconds| seconds <= 0)
+        {
+            return Err(ApiError::Invalid {
+                message: "spec.expirationSeconds must be greater than zero".to_owned(),
+            });
+        }
+        if let Some(reference) = &self.spec.bound_object_ref {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Desired token audience, lifetime and optional live Kubernetes object binding.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRequestSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiration_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_object_ref: Option<BoundObjectReference>,
+}
+
+/// Identifies a live object whose existence and immutable UID constrain a token's validity.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundObjectReference {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+}
+
+impl BoundObjectReference {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.kind.is_empty()
+            || self.api_version.is_empty()
+            || self.name.is_empty()
+            || self.uid.is_empty()
+        {
+            return Err(ApiError::Invalid {
+                message: "spec.boundObjectRef requires kind, apiVersion, name and uid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Server-populated token response fields. TokenRequest requests are never persisted.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRequestStatus {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub expiration_timestamp: Option<OffsetDateTime>,
+}
+
+impl TokenRequestStatus {
+    fn is_empty(&self) -> bool {
+        self.token.is_empty() && self.expiration_timestamp.is_none()
+    }
 }
 
 /// Typed core/v1 ServiceAccount identity object.

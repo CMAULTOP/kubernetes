@@ -6,11 +6,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts, RsaPublicKey};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
+use rsa::{
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    traits::PublicKeyParts,
+    RsaPrivateKey, RsaPublicKey,
+};
 use rusternetes_common::ApiError;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 
 /// Kubernetes request identity established before authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,7 +172,7 @@ impl ServiceAccountOidcDiscovery {
 ///
 /// This typed result deliberately does not establish a request identity by itself: callers must
 /// still verify the signed ServiceAccount UID against live storage before accepting the token.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VerifiedServiceAccountJwt {
     pub iss: String,
     pub sub: String,
@@ -174,7 +182,7 @@ pub struct VerifiedServiceAccountJwt {
     pub kubernetes: KubernetesServiceAccountClaims,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KubernetesServiceAccountClaims {
     pub namespace: String,
     #[serde(rename = "serviceaccount")]
@@ -185,14 +193,14 @@ pub struct KubernetesServiceAccountClaims {
     pub node: Option<KubernetesBoundObjectClaims>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KubernetesServiceAccountIdentityClaims {
     pub name: String,
     pub uid: String,
 }
 
 /// Name and UID claim for a Pod- or Node-bound ServiceAccount token.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KubernetesBoundObjectClaims {
     pub name: String,
     pub uid: String,
@@ -242,6 +250,33 @@ impl ServiceAccountJwtVerifier {
         ServiceAccountOidcDiscovery::new(issuer, jwks_uri, &self.keys)
     }
 
+    fn accepts_issuer(&self, issuer: &ServiceAccountTokenIssuer) -> Result<(), ApiError> {
+        if self.issuer != issuer.issuer || self.audiences != issuer.default_audiences {
+            return Err(ApiError::Invalid {
+                message:
+                    "ServiceAccount token issuer must use the verifier issuer and default audiences"
+                        .to_owned(),
+            });
+        }
+        let signing_public_key = issuer.public_key()?;
+        let matches = self.keys.iter().any(|configured| {
+            configured.key_id.as_deref() == Some(issuer.key_id.as_str())
+                && RsaPublicKey::from_public_key_pem(&configured.rsa_public_key_pem).is_ok_and(
+                    |public_key| {
+                        public_key.n() == signing_public_key.n()
+                            && public_key.e() == signing_public_key.e()
+                    },
+                )
+        });
+        if !matches {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount token issuer private key does not match a configured verifier key ID"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn verify(&self, token: &str) -> Result<VerifiedServiceAccountJwt, ApiError> {
         let header =
             decode_header(token).map_err(|_| unauthorized("invalid ServiceAccount JWT"))?;
@@ -270,6 +305,169 @@ impl ServiceAccountJwtVerifier {
             }
         }
         Err(unauthorized("ServiceAccount JWT was not accepted"))
+    }
+}
+
+/// Upper duration bound for one issued ServiceAccount TokenRequest credential.
+pub const MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 31_536_000;
+
+/// Signs time-bounded RS256 ServiceAccount TokenRequest JWTs.
+///
+/// A token issuer is accepted by `AuthenticationChain` only after its private key, issuer and
+/// default audiences are matched against the active verifier configuration. This prevents issuing
+/// credentials that the same control plane cannot authenticate.
+#[derive(Clone, Debug)]
+pub struct ServiceAccountTokenIssuer {
+    issuer: String,
+    default_audiences: Vec<String>,
+    rsa_private_key_pem: String,
+    key_id: String,
+    default_expiration_seconds: i64,
+    max_expiration_seconds: i64,
+}
+
+/// Immutable information that is signed into one ServiceAccount token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAccountTokenSubject {
+    pub namespace: String,
+    pub service_account_name: String,
+    pub service_account_uid: String,
+    pub pod: Option<KubernetesBoundObjectClaims>,
+    pub node: Option<KubernetesBoundObjectClaims>,
+}
+
+/// A signed bearer token and its exact expiration instant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuedServiceAccountToken {
+    pub token: String,
+    pub expiration_timestamp: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct SignedServiceAccountJwt {
+    iss: String,
+    sub: String,
+    aud: Vec<String>,
+    exp: i64,
+    iat: i64,
+    nbf: i64,
+    jti: String,
+    #[serde(rename = "kubernetes.io")]
+    kubernetes: KubernetesServiceAccountClaims,
+}
+
+impl ServiceAccountTokenIssuer {
+    pub fn new(
+        issuer: impl Into<String>,
+        default_audiences: Vec<String>,
+        rsa_private_key_pem: impl Into<String>,
+        key_id: impl Into<String>,
+        default_expiration_seconds: i64,
+        max_expiration_seconds: i64,
+    ) -> Result<Self, ApiError> {
+        let issuer = issuer.into();
+        let rsa_private_key_pem = rsa_private_key_pem.into();
+        let key_id = key_id.into();
+        if issuer.is_empty()
+            || default_audiences.is_empty()
+            || default_audiences.iter().any(String::is_empty)
+            || key_id.is_empty()
+            || default_expiration_seconds <= 0
+            || max_expiration_seconds < default_expiration_seconds
+            || max_expiration_seconds > MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS
+        {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount token issuer requires issuer, non-empty default audiences, key ID, and bounded positive expiration settings".to_owned(),
+            });
+        }
+        RsaPrivateKey::from_pkcs8_pem(&rsa_private_key_pem).map_err(|_| ApiError::Invalid {
+            message: "configured ServiceAccount token signing private key is invalid PKCS#8 PEM"
+                .to_owned(),
+        })?;
+        Ok(Self {
+            issuer,
+            default_audiences,
+            rsa_private_key_pem,
+            key_id,
+            default_expiration_seconds,
+            max_expiration_seconds,
+        })
+    }
+
+    fn public_key(&self) -> Result<RsaPublicKey, ApiError> {
+        RsaPrivateKey::from_pkcs8_pem(&self.rsa_private_key_pem)
+            .map(RsaPublicKey::from)
+            .map_err(|_| ApiError::Invalid {
+                message:
+                    "configured ServiceAccount token signing private key is invalid PKCS#8 PEM"
+                        .to_owned(),
+            })
+    }
+
+    pub fn issue(
+        &self,
+        subject: ServiceAccountTokenSubject,
+        requested_audiences: &[String],
+        requested_expiration_seconds: Option<i64>,
+        now: OffsetDateTime,
+    ) -> Result<IssuedServiceAccountToken, ApiError> {
+        if subject.namespace.is_empty()
+            || subject.service_account_name.is_empty()
+            || subject.service_account_uid.is_empty()
+            || requested_audiences.iter().any(String::is_empty)
+        {
+            return Err(ApiError::Invalid {
+                message: "ServiceAccount token subject and requested audiences must be non-empty"
+                    .to_owned(),
+            });
+        }
+        let requested_expiration_seconds =
+            requested_expiration_seconds.unwrap_or(self.default_expiration_seconds);
+        if requested_expiration_seconds <= 0 {
+            return Err(ApiError::Invalid {
+                message: "requested ServiceAccount token expiration must be greater than zero"
+                    .to_owned(),
+            });
+        }
+        let expiration_seconds = requested_expiration_seconds.min(self.max_expiration_seconds);
+        let expiration_timestamp = now
+            .checked_add(Duration::seconds(expiration_seconds))
+            .ok_or(ApiError::Internal)?;
+        let audiences = if requested_audiences.is_empty() {
+            self.default_audiences.clone()
+        } else {
+            requested_audiences.to_vec()
+        };
+        let claims = SignedServiceAccountJwt {
+            iss: self.issuer.clone(),
+            sub: format!(
+                "system:serviceaccount:{}:{}",
+                subject.namespace, subject.service_account_name
+            ),
+            aud: audiences,
+            exp: expiration_timestamp.unix_timestamp(),
+            iat: now.unix_timestamp(),
+            nbf: now.unix_timestamp(),
+            jti: Uuid::new_v4().to_string(),
+            kubernetes: KubernetesServiceAccountClaims {
+                namespace: subject.namespace,
+                service_account: KubernetesServiceAccountIdentityClaims {
+                    name: subject.service_account_name,
+                    uid: subject.service_account_uid,
+                },
+                pod: subject.pod,
+                node: subject.node,
+            },
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.key_id.clone());
+        let signing_key = EncodingKey::from_rsa_pem(self.rsa_private_key_pem.as_bytes())
+            .map_err(|_| ApiError::Internal)?;
+        let token = encode(&header, &claims, &signing_key).map_err(|_| ApiError::Internal)?;
+        Ok(IssuedServiceAccountToken {
+            token,
+            expiration_timestamp,
+        })
     }
 }
 
@@ -328,6 +526,7 @@ pub struct AuthenticationChain {
     anonymous_policy: AnonymousPolicy,
     static_bearer_tokens: Vec<StaticBearerToken>,
     service_account_jwt_verifier: Option<ServiceAccountJwtVerifier>,
+    service_account_token_issuer: Option<ServiceAccountTokenIssuer>,
     service_account_oidc_discovery: Option<ServiceAccountOidcDiscovery>,
 }
 
@@ -340,6 +539,7 @@ impl AuthenticationChain {
             anonymous_policy,
             static_bearer_tokens,
             service_account_jwt_verifier: None,
+            service_account_token_issuer: None,
             service_account_oidc_discovery: None,
         }
     }
@@ -356,6 +556,28 @@ impl AuthenticationChain {
 
     pub fn service_account_jwt_verifier(&self) -> Option<&ServiceAccountJwtVerifier> {
         self.service_account_jwt_verifier.as_ref()
+    }
+
+    /// Enables token issuance only when the signing private key matches the active verifier's
+    /// public key (including key ID), issuer and default audience configuration.
+    pub fn with_service_account_token_issuer(
+        mut self,
+        issuer: ServiceAccountTokenIssuer,
+    ) -> Result<Self, ApiError> {
+        let verifier =
+            self.service_account_jwt_verifier
+                .as_ref()
+                .ok_or_else(|| ApiError::Invalid {
+                    message: "ServiceAccount JWT verifier must be configured before token issuance"
+                        .to_owned(),
+                })?;
+        verifier.accepts_issuer(&issuer)?;
+        self.service_account_token_issuer = Some(issuer);
+        Ok(self)
+    }
+
+    pub fn service_account_token_issuer(&self) -> Option<&ServiceAccountTokenIssuer> {
+        self.service_account_token_issuer.as_ref()
     }
 
     /// Enables OIDC discovery derived from the same configured ServiceAccount JWT verifier keys.
@@ -557,6 +779,64 @@ mod tests {
         let claims = verifier.verify(&token).expect("signed token verifies");
         assert_eq!(claims.sub, "system:serviceaccount:default:build-robot");
         assert_eq!(claims.kubernetes.service_account.uid, "uid-42");
+    }
+
+    #[test]
+    fn token_issuer_emits_verifier_compatible_rs256_token_with_capped_lifetime() {
+        const PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCG3Yw89KOLRWtu\nCT+ALJkMsB8U0dTHtHr3tIGWPaZ6V3czsNR/khVrgL0HHJN/a6Fvfkk08BbRNiBD\n1uDifj/kMPx0XPWyipIe6Zow7tr3r1XAe0k7lw9gCQqpeIZLHCRNCIXgxKZqgK8+\nUyRgXT/bWy0NQmQlwevVUuxB8rlfrrS10r2y5Z5brPFiJ3BYK33gtqVDzmU5xmPD\ndh8rKZedGsJY09SZ7t0sWjaUEn8rbA265xRlc8aDnRp4SCavg5VM/FUClEvlvzm1\nppyZsa5dXL+hpS8XQzeIORGBk0o3S9k828/i1z4oX/4NYM7WayYViSKIbrzjzOq1\nGdjQMnrJAgMBAAECggEAAw3JOyge++xafmdfNLvNy2fBjGsj8lG35xwDQy+qMWMB\no/4BEdJxAbosjZisDlqVkTy+06AMJDihime3N+m78KLbVJc2SRCyNlj70NfXxXwG\n6RDhm6PUCUyrHSNJhzHf8I6c2XYafpbjYPno/PWfmIv7/Szfr6swd+gkyWmBoRT/\nQFAyswqu7Zr0xqWaDpPvvpbnTxn0a/OdMbF/ttJnLEfK8RnO8RxKH4wkW8MUnQbp\nfOO1QQCTSTTy1lAfyB8Vpxtsa6qtXBeoyplPQk6xavZZE0CspSSCc35Cb3t0NT1L\nwmP3Djs+RT6nfjyqhH6B6Zkz1WFSJ1Ck/OzxqyRCAQKBgQC6J66SCJL1+lr904MT\nGXfHAh1iBnc9c/r3ei9D8IJYPUL6agrB6PghQTyTUUCXsuTkP7kZr4fDhl+YEmxV\nFsz4UjFwIu4/4GCPDyQxvK4e3nYrkeXcB1sSkqklQIGPexiNah7ZdOfSGYaMzZP+\nmyWZp9gHjfrTZMCPxTBl/yQIUQKBgQC5d3ck5W06nbeqI0cW1Mi0XRtZqiWOQf5J\njzHpqhKMMcodV4pF8JQxQEnQ0cCWuBeiRSa1ld14rSgcZrpWChLFUCuUTCN0bWNY\nJc1PVA1Er+7aKwvvYoLHzhuqZrHefzf0Pm4M0khZV9UsyGXehZ4lmKBMNvnblgbI\nYW7dwYsk+QKBgFpPOf+arUEsDcyqOiKf7l3bhsmxfVOQ2qYI3rlFCtcoEUBPBZ0B\nGq93aJ3Hg2CU5zpcN75gS6rtm565AVleUF3/8gAG0jKm9fExVUvTz10ma4nDpBHU\nd7hQ8kIiQziKbWTdoM26S2TAAWh5q1yPg/RBWyp/FLpNXKXi8hHpb1+hAoGALzQg\ntttNuaV6oWrpJP5zNrSbyW5ssJBLUB2J7pbCsbvaXS1ym+pnTUG3h9Za1gF0wnAn\nMgA6pgQsOU5MDqnxrRaCgPP/8hoFNuIoJxCVb+33NL/QAdVow8HJeM06aA6pBxj8\nmXbLwzF/qC44/zGy1o7J/Zvga+r7PvTNatNfvsECgYBD+cN52j+WJ8ZRYquvMM26\n2FCfDwxGPDayJcpG2iPq1qQtc+wPAFUM2OAnh99ISwiqpwV2kBY4651/z40QLy9q\nj4WA5AZceC4lk4woTcoA5Q+3ngH+9q2AoT7kqK70hXd434i6weLDIOuKbV8akv2K\nyERt1OwAWzIuLBxT/hKsug==\n-----END PRIVATE KEY-----\n";
+        const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAht2MPPSji0Vrbgk/gCyZ\nDLAfFNHUx7R697SBlj2meld3M7DUf5IVa4C9BxyTf2uhb35JNPAW0TYgQ9bg4n4/\n5DD8dFz1soqSHumaMO7a969VwHtJO5cPYAkKqXiGSxwkTQiF4MSmaoCvPlMkYF0/\n21stDUJkJcHr1VLsQfK5X660tdK9suWeW6zxYidwWCt94LalQ85lOcZjw3YfKymX\nnRrCWNPUme7dLFo2lBJ/K2wNuucUZXPGg50aeEgmr4OVTPxVApRL5b85taacmbGu\nXVy/oaUvF0M3iDkRgZNKN0vZPNvP4tc+KF/+DWDO1msmFYkiiG6848zqtRnY0DJ6\nyQIDAQAB\n-----END PUBLIC KEY-----\n";
+        let verifier = ServiceAccountJwtVerifier::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            vec![ServiceAccountJwtKey {
+                key_id: Some("active".to_owned()),
+                rsa_public_key_pem: PUBLIC_KEY.to_owned(),
+            }],
+        )
+        .expect("valid verifier");
+        let issuer = ServiceAccountTokenIssuer::new(
+            "https://issuer.example",
+            vec!["api".to_owned()],
+            PRIVATE_KEY,
+            "active",
+            10,
+            20,
+        )
+        .expect("valid token issuer");
+        let chain = AuthenticationChain::default()
+            .with_service_account_jwt_verifier(verifier.clone())
+            .with_service_account_token_issuer(issuer.clone())
+            .expect("matching verifier and issuer configurations");
+        assert!(chain.service_account_token_issuer().is_some());
+        let issued = issuer
+            .issue(
+                ServiceAccountTokenSubject {
+                    namespace: "default".to_owned(),
+                    service_account_name: "build-robot".to_owned(),
+                    service_account_uid: "sa-uid".to_owned(),
+                    pod: Some(KubernetesBoundObjectClaims {
+                        name: "workload".to_owned(),
+                        uid: "pod-uid".to_owned(),
+                    }),
+                    node: None,
+                },
+                &[],
+                Some(1_000),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("token signs");
+        let claims = verifier.verify(&issued.token).expect("token verifies");
+        assert_eq!(claims.aud, ["api"]);
+        assert_eq!(claims.kubernetes.service_account.uid, "sa-uid");
+        assert_eq!(claims.kubernetes.pod.expect("pod binding").uid, "pod-uid");
+        assert_eq!(
+            decode_header(&issued.token)
+                .expect("JWT header parses")
+                .kid
+                .as_deref(),
+            Some("active")
+        );
+        assert!(issued.expiration_timestamp <= OffsetDateTime::now_utc() + Duration::seconds(21));
     }
 
     fn chain(policy: AnonymousPolicy) -> AuthenticationChain {

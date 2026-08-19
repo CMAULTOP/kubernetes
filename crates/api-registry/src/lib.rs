@@ -164,7 +164,12 @@ impl ApiRegistry {
                     kind: "ServiceAccount",
                     scope: ResourceScope::Namespaced,
                     verbs: &["create", "delete", "get", "list", "update", "watch"],
-                    subresources: &[],
+                    subresources: &[SubresourceStrategy {
+                        name: "token",
+                        discovery_name: "serviceaccounts/token",
+                        kind: "TokenRequest",
+                        verbs: &["create"],
+                    }],
                 },
                 ResourceStrategy {
                     plural: "nodes",
@@ -287,6 +292,20 @@ impl ApiRegistry {
                     None,
                 )
             }
+            ["api", "v1", "namespaces", namespace, plural, name, subresource] => {
+                let resource = resolve(plural)?;
+                let subresource = resource
+                    .subresources
+                    .iter()
+                    .find(|strategy| strategy.name == *subresource)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    matches!(resource.scope, ResourceScope::Namespaced).then(|| (*name).to_owned()),
+                    Some(subresource.name),
+                )
+            }
             ["api", "v1", plural, name, subresource] => {
                 let resource = resolve(plural)?;
                 let subresource = resource
@@ -333,7 +352,7 @@ mod tests {
         let registry = ApiRegistry::core_v1();
         assert_eq!(registry.core_api_versions().versions, vec!["v1"]);
         let discovery = registry.discovery("", "v1").expect("core v1 is registered");
-        assert_eq!(discovery.resources.len(), 6);
+        assert_eq!(discovery.resources.len(), 7);
         assert!(discovery
             .resources
             .iter()
@@ -400,6 +419,22 @@ mod tests {
         assert_eq!(service_account.resource.kind, "ServiceAccount");
         assert_eq!(service_account.namespace.as_deref(), Some("development"));
         assert_eq!(service_account.name.as_deref(), Some("build-robot"));
+
+        let token = registry
+            .resolve_core_v1_path(
+                "/api/v1/namespaces/development/serviceaccounts/build-robot/token",
+            )
+            .expect("namespaced ServiceAccount token subresource resolves");
+        assert_eq!(token.resource.kind, "ServiceAccount");
+        assert_eq!(token.namespace.as_deref(), Some("development"));
+        assert_eq!(token.name.as_deref(), Some("build-robot"));
+        assert_eq!(token.subresource, Some("token"));
+        assert!(discovery.resources.iter().any(|resource| {
+            resource.name == "serviceaccounts/token"
+                && resource.namespaced
+                && resource.kind == "TokenRequest"
+                && resource.verbs == ["create"]
+        }));
     }
 
     #[test]

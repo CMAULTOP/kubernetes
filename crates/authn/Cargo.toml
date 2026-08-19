@@ -13,5 +13,7 @@ serde.workspace = true
 rsa.workspace = true
 rusternetes-common = { path = "../common" }
 subtle.workspace = true
+time.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
