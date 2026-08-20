@@ -18,6 +18,7 @@ pub const AUTHORIZATION_V1_API_VERSION: &str = "authorization.k8s.io/v1";
 pub const TOKEN_REQUEST_KIND: &str = "TokenRequest";
 pub const TOKEN_REVIEW_KIND: &str = "TokenReview";
 pub const SELF_SUBJECT_ACCESS_REVIEW_KIND: &str = "SelfSubjectAccessReview";
+pub const SUBJECT_ACCESS_REVIEW_KIND: &str = "SubjectAccessReview";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -129,6 +130,13 @@ impl TypeMeta {
         Self {
             api_version: AUTHORIZATION_V1_API_VERSION.to_owned(),
             kind: SELF_SUBJECT_ACCESS_REVIEW_KIND.to_owned(),
+        }
+    }
+
+    pub fn subject_access_review() -> Self {
+        Self {
+            api_version: AUTHORIZATION_V1_API_VERSION.to_owned(),
+            kind: SUBJECT_ACCESS_REVIEW_KIND.to_owned(),
         }
     }
 }
@@ -575,6 +583,106 @@ impl TokenReviewUserInfo {
             && self.uid.is_empty()
             && self.groups.is_empty()
             && self.extra.is_empty()
+    }
+}
+
+/// A create-only authorization.k8s.io/v1 request that delegates an authorization decision for
+/// one explicit subject against exactly one resource or non-resource target.
+///
+/// It is non-persistent: the API server validates the request and returns a server-owned status.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectAccessReview {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: SubjectAccessReviewSpec,
+    #[serde(default)]
+    pub status: SubjectAccessReviewStatus,
+}
+
+impl SubjectAccessReview {
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        if !self.type_meta.api_version.is_empty()
+            && self.type_meta.api_version != AUTHORIZATION_V1_API_VERSION
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "apiVersion must be {AUTHORIZATION_V1_API_VERSION}, got {}",
+                    self.type_meta.api_version
+                ),
+            });
+        }
+        if !self.type_meta.kind.is_empty() && self.type_meta.kind != SUBJECT_ACCESS_REVIEW_KIND {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "kind must be {SUBJECT_ACCESS_REVIEW_KIND}, got {}",
+                    self.type_meta.kind
+                ),
+            });
+        }
+        self.type_meta = TypeMeta::subject_access_review();
+        Ok(())
+    }
+
+    /// Validates client-owned request data. Metadata and status are server-owned for this
+    /// non-persistent create operation.
+    pub fn validate_request(&self) -> Result<(), ApiError> {
+        if self.metadata != ObjectMeta::default() {
+            return Err(ApiError::Invalid {
+                message: "metadata must be empty in a SubjectAccessReview request".to_owned(),
+            });
+        }
+        if !self.status.is_empty() {
+            return Err(ApiError::Invalid {
+                message:
+                    "status is server-owned and must not be set in a SubjectAccessReview request"
+                        .to_owned(),
+            });
+        }
+        self.spec.validate()
+    }
+}
+
+/// Delegated subject and target of one SubjectAccessReview. Kubernetes permits a groups-only
+/// subject, but at least one of `user` or `groups` is mandatory.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectAccessReviewSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_attributes: Option<AccessReviewResourceAttributes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_resource_attributes: Option<AccessReviewNonResourceAttributes>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Vec<String>>,
+}
+
+impl SubjectAccessReviewSpec {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.user.is_empty() && self.groups.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "at least one of spec.user or spec.groups must be set".to_owned(),
+            });
+        }
+        match (
+            self.resource_attributes.as_ref(),
+            self.non_resource_attributes.as_ref(),
+        ) {
+            (Some(resource), None) => resource.validate(),
+            (None, Some(non_resource)) => non_resource.validate(),
+            _ => Err(ApiError::Invalid {
+                message: "exactly one of spec.resourceAttributes or spec.nonResourceAttributes must be set"
+                    .to_owned(),
+            }),
+        }
     }
 }
 
@@ -2514,6 +2622,41 @@ mod tests {
         assert!(selector.matches(&config_map()));
         assert!(matches!(
             FieldSelector::parse(Some("spec.nodeName=worker-a")),
+            Err(ApiError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn subject_access_review_accepts_groups_only_and_rejects_server_owned_fields() {
+        let mut review = SubjectAccessReview {
+            spec: SubjectAccessReviewSpec {
+                groups: vec!["team-a".to_owned()],
+                resource_attributes: Some(AccessReviewResourceAttributes {
+                    verb: "get".to_owned(),
+                    resource: "configmaps".to_owned(),
+                    ..AccessReviewResourceAttributes::default()
+                }),
+                ..SubjectAccessReviewSpec::default()
+            },
+            ..SubjectAccessReview::default()
+        };
+        review
+            .enforce_type_meta()
+            .expect("empty TypeMeta is canonicalized");
+        review
+            .validate_request()
+            .expect("groups-only subject access review is valid");
+        assert_eq!(review.type_meta, TypeMeta::subject_access_review());
+
+        review.status.allowed = true;
+        assert!(matches!(
+            review.validate_request(),
+            Err(ApiError::Invalid { .. })
+        ));
+        review.status = SubjectAccessReviewStatus::default();
+        review.metadata.name = Some("not-persistent".to_owned());
+        assert!(matches!(
+            review.validate_request(),
             Err(ApiError::Invalid { .. })
         ));
     }

@@ -21,9 +21,10 @@ use rusternetes_admission::{
 };
 use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
-    ApiGroup, ApiGroupList, ApiResourceList, ApiStatus, ConfigMap, ConfigMapList, DeleteOptions,
-    FieldSelector, LabelSelector, Namespace, NamespaceList, NamespacePhase, Node, NodeList, Pod,
-    PodList, SelfSubjectAccessReview, ServiceAccount, ServiceAccountList,
+    AccessReviewNonResourceAttributes, AccessReviewResourceAttributes, ApiGroup, ApiGroupList,
+    ApiResourceList, ApiStatus, ConfigMap, ConfigMapList, DeleteOptions, FieldSelector,
+    LabelSelector, Namespace, NamespaceList, NamespacePhase, Node, NodeList, Pod, PodList,
+    SelfSubjectAccessReview, ServiceAccount, ServiceAccountList, SubjectAccessReview,
     SubjectAccessReviewStatus, TokenRequest, TokenReview, TokenReviewStatus, TokenReviewUserInfo,
     TypeMeta,
 };
@@ -744,6 +745,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
             axum::routing::post(create_self_subject_access_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            axum::routing::post(create_subject_access_review),
         )
         .route("/api/v1", get(core_v1_api_resources))
         .route("/api/v1/configmaps", get(list_all_config_maps))
@@ -1882,14 +1887,63 @@ async fn create_self_subject_access_review(
     Ok(Json(review))
 }
 
+/// Evaluates an explicit subject from the review body. The normal request authorization
+/// middleware separately protects this endpoint using the authenticated caller's identity.
+async fn create_subject_access_review(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<Json<SubjectAccessReview>> {
+    let mut review = decode_subject_access_review(body)?;
+    review.enforce_type_meta()?;
+    review.validate_request()?;
+    let identity = subject_access_review_identity(&review);
+    let request = subject_access_review_request(&review)?;
+    let allowed = match &state.authorization {
+        AuthorizationMode::AlwaysAllow => true,
+        AuthorizationMode::Rbac(authorizer) => authorizer.authorize(&identity, &request),
+    };
+    review.status = SubjectAccessReviewStatus {
+        allowed,
+        // The current Rust RBAC evaluator is additive-only. A missing match is no opinion, not an
+        // explicit deny verdict, even though the outer API request remains fail-closed.
+        denied: false,
+        reason: String::new(),
+        evaluation_error: String::new(),
+    };
+    Ok(Json(review))
+}
+
 fn self_subject_access_review_request(
     review: &SelfSubjectAccessReview,
 ) -> ApiResult<AuthorizationRequest> {
-    let optional = |value: &str| (!value.is_empty()).then(|| value.to_owned());
-    match (
+    access_review_request(
         review.spec.resource_attributes.as_ref(),
         review.spec.non_resource_attributes.as_ref(),
-    ) {
+    )
+}
+
+fn subject_access_review_request(review: &SubjectAccessReview) -> ApiResult<AuthorizationRequest> {
+    access_review_request(
+        review.spec.resource_attributes.as_ref(),
+        review.spec.non_resource_attributes.as_ref(),
+    )
+}
+
+fn subject_access_review_identity(review: &SubjectAccessReview) -> RequestIdentity {
+    RequestIdentity {
+        username: review.spec.user.clone(),
+        uid: (!review.spec.uid.is_empty()).then(|| review.spec.uid.clone()),
+        groups: review.spec.groups.iter().cloned().collect(),
+        extra: review.spec.extra.clone(),
+    }
+}
+
+fn access_review_request(
+    resource_attributes: Option<&AccessReviewResourceAttributes>,
+    non_resource_attributes: Option<&AccessReviewNonResourceAttributes>,
+) -> ApiResult<AuthorizationRequest> {
+    let optional = |value: &str| (!value.is_empty()).then(|| value.to_owned());
+    match (resource_attributes, non_resource_attributes) {
         (Some(resource), None) => Ok(AuthorizationRequest::resource(
             resource.verb.clone(),
             resource.group.clone(),
@@ -2700,6 +2754,21 @@ fn decode_self_subject_access_review(body: Bytes) -> ApiResult<SelfSubjectAccess
     serde_json::from_slice(&body).map_err(|error| {
         ApiError::BadRequest {
             message: format!("invalid SelfSubjectAccessReview JSON: {error}"),
+        }
+        .into()
+    })
+}
+
+fn decode_subject_access_review(body: Bytes) -> ApiResult<SubjectAccessReview> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a SubjectAccessReview JSON request body is required".to_owned(),
+        }
+        .into());
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        ApiError::BadRequest {
+            message: format!("invalid SubjectAccessReview JSON: {error}"),
         }
         .into()
     })
@@ -4735,6 +4804,406 @@ mod tests {
         .expect("AlwaysAllow SSAR response is JSON");
         assert_eq!(review["status"]["allowed"], true);
         assert!(review["status"].get("denied").is_none());
+    }
+
+    fn subject_access_review_test_app() -> Router {
+        let delegator = RequestIdentity::authenticated(
+            "review-delegator",
+            Some("delegator-uid".to_owned()),
+            ["review-delegators".to_owned()],
+            Default::default(),
+        )
+        .expect("delegator identity is valid");
+        let untrusted = RequestIdentity::authenticated(
+            "untrusted-caller",
+            Some("untrusted-uid".to_owned()),
+            ["untrusted".to_owned()],
+            Default::default(),
+        )
+        .expect("untrusted caller identity is valid");
+        let authentication = AuthenticationChain::new(
+            AnonymousPolicy::Deny,
+            vec![
+                StaticBearerToken::new("delegator-secret", delegator)
+                    .expect("delegator token is valid"),
+                StaticBearerToken::new("untrusted-secret", untrusted)
+                    .expect("untrusted token is valid"),
+            ],
+        );
+        let authorizer = RbacAuthorizer::new(
+            Vec::new(),
+            vec![
+                rusternetes_authz_rbac::ClusterRole {
+                    name: "subject-access-review-creator".to_owned(),
+                    rules: vec![
+                        rusternetes_authz_rbac::PolicyRule {
+                            api_groups: vec!["authorization.k8s.io".to_owned()],
+                            resources: vec!["subjectaccessreviews".to_owned()],
+                            verbs: vec!["create".to_owned()],
+                            ..rusternetes_authz_rbac::PolicyRule::default()
+                        },
+                        rusternetes_authz_rbac::PolicyRule {
+                            verbs: vec!["get".to_owned()],
+                            non_resource_urls: vec!["/apis/authorization.k8s.io/v1".to_owned()],
+                            ..rusternetes_authz_rbac::PolicyRule::default()
+                        },
+                    ],
+                },
+                rusternetes_authz_rbac::ClusterRole {
+                    name: "workload-configmap-reader".to_owned(),
+                    rules: vec![rusternetes_authz_rbac::PolicyRule {
+                        api_groups: vec![String::new()],
+                        resources: vec!["configmaps".to_owned()],
+                        verbs: vec!["get".to_owned()],
+                        ..rusternetes_authz_rbac::PolicyRule::default()
+                    }],
+                },
+                rusternetes_authz_rbac::ClusterRole {
+                    name: "team-health-reader".to_owned(),
+                    rules: vec![rusternetes_authz_rbac::PolicyRule {
+                        verbs: vec!["get".to_owned()],
+                        non_resource_urls: vec!["/healthz".to_owned()],
+                        ..rusternetes_authz_rbac::PolicyRule::default()
+                    }],
+                },
+            ],
+            Vec::new(),
+            vec![
+                rusternetes_authz_rbac::ClusterRoleBinding {
+                    name: "delegator-may-create-subject-access-reviews".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::User(
+                        "review-delegator".to_owned(),
+                    )],
+                    role_ref: "subject-access-review-creator".to_owned(),
+                },
+                rusternetes_authz_rbac::ClusterRoleBinding {
+                    name: "workload-configmap-reader-binding".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::User(
+                        "workload-reader".to_owned(),
+                    )],
+                    role_ref: "workload-configmap-reader".to_owned(),
+                },
+                rusternetes_authz_rbac::ClusterRoleBinding {
+                    name: "team-health-reader-binding".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::Group("team-a".to_owned())],
+                    role_ref: "team-health-reader".to_owned(),
+                },
+            ],
+        );
+        router_with_backend_auth_and_authorization(
+            ConfigMapBackend::InMemory(Arc::new(InMemoryConfigMapStore::new())),
+            authentication,
+            AuthorizationMode::Rbac(authorizer),
+        )
+    }
+
+    #[tokio::test]
+    async fn subject_access_review_evaluates_delegated_and_group_only_subjects_with_typed_discovery(
+    ) {
+        let app = subject_access_review_test_app();
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apis/authorization.k8s.io/v1")
+                    .header("authorization", "Bearer delegator-secret")
+                    .body(Body::empty())
+                    .expect("valid authorization discovery request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let discovery: serde_json::Value = serde_json::from_slice(
+            &to_bytes(discovery.into_body(), usize::MAX)
+                .await
+                .expect("authorization discovery body is readable"),
+        )
+        .expect("authorization discovery is JSON");
+        assert!(discovery["resources"]
+            .as_array()
+            .is_some_and(|resources| resources.iter().any(|resource| resource["name"]
+                == "subjectaccessreviews"
+                && resource["namespaced"] == false
+                && resource["kind"] == "SubjectAccessReview"
+                && resource["verbs"] == serde_json::json!(["create"]))));
+
+        let delegated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                    .header("authorization", "Bearer delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "SubjectAccessReview",
+                            "spec": {
+                                "user": "workload-reader",
+                                "uid": "workload-reader-uid",
+                                "groups": ["workloads"],
+                                "extra": { "tenant": ["blue"] },
+                                "resourceAttributes": {
+                                    "verb": "get",
+                                    "resource": "configmaps",
+                                    "namespace": "default"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid delegated SubjectAccessReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(delegated.status(), StatusCode::OK);
+        let delegated: serde_json::Value = serde_json::from_slice(
+            &to_bytes(delegated.into_body(), usize::MAX)
+                .await
+                .expect("delegated SubjectAccessReview body is readable"),
+        )
+        .expect("delegated SubjectAccessReview is JSON");
+        assert_eq!(delegated["status"]["allowed"], true);
+        assert_eq!(delegated["spec"]["user"], "workload-reader");
+        assert_eq!(delegated["spec"]["uid"], "workload-reader-uid");
+        assert_eq!(
+            delegated["spec"]["extra"]["tenant"],
+            serde_json::json!(["blue"])
+        );
+
+        let group_only = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                    .header("authorization", "Bearer delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "SubjectAccessReview",
+                            "spec": {
+                                "groups": ["team-a"],
+                                "nonResourceAttributes": { "verb": "get", "path": "/healthz" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid groups-only SubjectAccessReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(group_only.status(), StatusCode::OK);
+        let group_only: serde_json::Value = serde_json::from_slice(
+            &to_bytes(group_only.into_body(), usize::MAX)
+                .await
+                .expect("groups-only SubjectAccessReview body is readable"),
+        )
+        .expect("groups-only SubjectAccessReview is JSON");
+        assert_eq!(group_only["status"]["allowed"], true);
+        assert!(group_only["spec"].get("user").is_none());
+
+        let no_opinion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                    .header("authorization", "Bearer delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "SubjectAccessReview",
+                            "spec": {
+                                "user": "unbound-workload",
+                                "resourceAttributes": {
+                                    "verb": "create",
+                                    "resource": "pods",
+                                    "namespace": "default"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid no-opinion SubjectAccessReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(no_opinion.status(), StatusCode::OK);
+        let no_opinion: serde_json::Value = serde_json::from_slice(
+            &to_bytes(no_opinion.into_body(), usize::MAX)
+                .await
+                .expect("no-opinion SubjectAccessReview body is readable"),
+        )
+        .expect("no-opinion SubjectAccessReview is JSON");
+        assert_eq!(no_opinion["status"]["allowed"], false);
+        assert!(no_opinion["status"].get("denied").is_none());
+    }
+
+    #[tokio::test]
+    async fn subject_access_review_rejects_untrusted_callers_and_invalid_server_owned_requests() {
+        let app = subject_access_review_test_app();
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                    .header("authorization", "Bearer untrusted-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "SubjectAccessReview",
+                            "spec": {
+                                "user": "workload-reader",
+                                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid unauthorized SubjectAccessReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let invalid_requests = [
+            (
+                "missing subject",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SubjectAccessReview",
+                    "spec": {
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    }
+                }),
+            ),
+            (
+                "ambiguous target",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SubjectAccessReview",
+                    "spec": {
+                        "user": "workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" },
+                        "nonResourceAttributes": { "verb": "get", "path": "/healthz" }
+                    }
+                }),
+            ),
+            (
+                "client supplied status",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SubjectAccessReview",
+                    "spec": {
+                        "user": "workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    },
+                    "status": { "allowed": true }
+                }),
+            ),
+            (
+                "client supplied metadata",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "SubjectAccessReview",
+                    "metadata": { "name": "not-persistent" },
+                    "spec": {
+                        "user": "workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    }
+                }),
+            ),
+        ];
+        for (description, body) in invalid_requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                        .header("authorization", "Bearer delegator-secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|error| {
+                            panic!("valid {description} SubjectAccessReview request: {error}")
+                        }),
+                )
+                .await
+                .expect("router is infallible");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{description} is rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_access_review_always_allow_returns_allowed_for_delegated_subject() {
+        let response = router(Arc::new(InMemoryConfigMapStore::new()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "SubjectAccessReview",
+                            "spec": {
+                                "user": "arbitrary-subject",
+                                "resourceAttributes": {
+                                    "verb": "delete",
+                                    "resource": "secrets",
+                                    "namespace": "default"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid AlwaysAllow SubjectAccessReview request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let review: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("AlwaysAllow SubjectAccessReview body is readable"),
+        )
+        .expect("AlwaysAllow SubjectAccessReview is JSON");
+        assert_eq!(review["status"]["allowed"], true);
+    }
+
+    #[test]
+    fn subject_access_review_path_maps_to_authorization_group_create_resource() {
+        let request = authorization_request_from_http(
+            &ApiRegistry::core_v1(),
+            &axum::http::Method::POST,
+            &"/apis/authorization.k8s.io/v1/subjectaccessreviews"
+                .parse()
+                .expect("valid SubjectAccessReview URI"),
+        );
+        assert_eq!(request.verb, "create");
+        assert!(matches!(
+            request.target,
+            rusternetes_authz_rbac::RequestTarget::Resource {
+                api_group,
+                resource,
+                subresource,
+                namespace,
+                name,
+            } if api_group == "authorization.k8s.io"
+                && resource == "subjectaccessreviews"
+                && subresource.is_none()
+                && namespace.is_none()
+                && name.is_none()
+        ));
     }
 
     #[test]

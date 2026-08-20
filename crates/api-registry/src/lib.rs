@@ -233,14 +233,24 @@ impl ApiRegistry {
             GroupVersionStrategy {
                 group: "authorization.k8s.io",
                 version: "v1",
-                resources: vec![ResourceStrategy {
-                    plural: "selfsubjectaccessreviews",
-                    singular: "selfsubjectaccessreview",
-                    kind: "SelfSubjectAccessReview",
-                    scope: ResourceScope::Cluster,
-                    verbs: &["create"],
-                    subresources: &[],
-                }],
+                resources: vec![
+                    ResourceStrategy {
+                        plural: "selfsubjectaccessreviews",
+                        singular: "selfsubjectaccessreview",
+                        kind: "SelfSubjectAccessReview",
+                        scope: ResourceScope::Cluster,
+                        verbs: &["create"],
+                        subresources: &[],
+                    },
+                    ResourceStrategy {
+                        plural: "subjectaccessreviews",
+                        singular: "subjectaccessreview",
+                        kind: "SubjectAccessReview",
+                        scope: ResourceScope::Cluster,
+                        verbs: &["create"],
+                        subresources: &[],
+                    },
+                ],
             },
         ])
         .expect("the built-in Rusternetes API registry is valid")

@@ -1469,6 +1469,133 @@ async fn self_subject_access_review_evaluates_rbac_through_real_etcd_core_server
 }
 
 #[tokio::test]
+async fn subject_access_review_evaluates_delegated_rbac_identity_through_real_etcd_core_server() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-sar-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let delegator = RequestIdentity::authenticated(
+        "etcd-review-delegator",
+        Some("etcd-delegator-uid".to_owned()),
+        ["review-delegators".to_owned()],
+        Default::default(),
+    )
+    .expect("delegator identity is valid");
+    let authentication = AuthenticationChain::new(
+        AnonymousPolicy::Deny,
+        vec![StaticBearerToken::new("etcd-delegator-secret", delegator)
+            .expect("delegator token is valid")],
+    );
+    let policy = RbacAuthorizer::new(
+        Vec::new(),
+        vec![
+            ClusterRole {
+                name: "etcd-subject-access-review-creator".to_owned(),
+                rules: vec![PolicyRule {
+                    api_groups: vec!["authorization.k8s.io".to_owned()],
+                    resources: vec!["subjectaccessreviews".to_owned()],
+                    verbs: vec!["create".to_owned()],
+                    ..PolicyRule::default()
+                }],
+            },
+            ClusterRole {
+                name: "etcd-delegated-configmap-reader".to_owned(),
+                rules: vec![PolicyRule {
+                    api_groups: vec![String::new()],
+                    resources: vec!["configmaps".to_owned()],
+                    verbs: vec!["get".to_owned()],
+                    ..PolicyRule::default()
+                }],
+            },
+        ],
+        Vec::new(),
+        vec![
+            ClusterRoleBinding {
+                name: "etcd-delegator-may-create-subject-access-reviews".to_owned(),
+                subjects: vec![Subject::User("etcd-review-delegator".to_owned())],
+                role_ref: "etcd-subject-access-review-creator".to_owned(),
+            },
+            ClusterRoleBinding {
+                name: "etcd-delegated-configmap-reader-binding".to_owned(),
+                subjects: vec![Subject::User("etcd-delegated-workload".to_owned())],
+                role_ref: "etcd-delegated-configmap-reader".to_owned(),
+            },
+        ],
+    );
+    let server = start_core_server_with_auth_and_authorization(
+        backend,
+        authentication,
+        AuthorizationMode::Rbac(policy),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let endpoint = format!(
+        "{}/apis/authorization.k8s.io/v1/subjectaccessreviews",
+        server.base_url
+    );
+
+    let allowed_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-delegator-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SubjectAccessReview",
+            "spec": {
+                "user": "etcd-delegated-workload",
+                "uid": "etcd-workload-uid",
+                "extra": { "tenant": ["green"] },
+                "resourceAttributes": {
+                    "verb": "get",
+                    "resource": "configmaps",
+                    "namespace": "default"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("delegated allowed SubjectAccessReview completes");
+    assert_eq!(allowed_response.status(), reqwest::StatusCode::OK);
+    let allowed: serde_json::Value = allowed_response
+        .json()
+        .await
+        .expect("delegated allowed SubjectAccessReview is JSON");
+    assert_eq!(allowed["status"]["allowed"], true);
+    assert_eq!(allowed["spec"]["user"], "etcd-delegated-workload");
+    assert_eq!(allowed["spec"]["uid"], "etcd-workload-uid");
+    assert_eq!(
+        allowed["spec"]["extra"]["tenant"],
+        serde_json::json!(["green"])
+    );
+
+    let no_opinion_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-delegator-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SubjectAccessReview",
+            "spec": {
+                "user": "etcd-unbound-workload",
+                "resourceAttributes": {
+                    "verb": "create",
+                    "resource": "pods",
+                    "namespace": "default"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("delegated no-opinion SubjectAccessReview completes");
+    assert_eq!(no_opinion_response.status(), reqwest::StatusCode::OK);
+    let no_opinion: serde_json::Value = no_opinion_response
+        .json()
+        .await
+        .expect("delegated no-opinion SubjectAccessReview is JSON");
+    assert_eq!(no_opinion["status"]["allowed"], false);
+    assert!(no_opinion["status"].get("denied").is_none());
+}
+
+#[tokio::test]
 async fn config_map_pagination_preserves_an_etcd_snapshot_across_continuation_requests() {
     let (_etcd, endpoint) = start_etcd().await;
     let prefix = format!("/rusternetes-pagination-tests/{}", Uuid::new_v4());
