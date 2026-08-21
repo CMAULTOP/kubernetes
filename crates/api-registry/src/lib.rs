@@ -250,6 +250,14 @@ impl ApiRegistry {
                         verbs: &["create"],
                         subresources: &[],
                     },
+                    ResourceStrategy {
+                        plural: "localsubjectaccessreviews",
+                        singular: "localsubjectaccessreview",
+                        kind: "LocalSubjectAccessReview",
+                        scope: ResourceScope::Namespaced,
+                        verbs: &["create"],
+                        subresources: &[],
+                    },
                 ],
             },
         ])
@@ -360,27 +368,92 @@ impl ApiRegistry {
             .split('/')
             .filter(|segment| !segment.is_empty())
             .collect::<Vec<_>>();
-        let (group, version, plural, name) = match segments.as_slice() {
-            ["apis", group, version, plural] => (*group, *version, *plural, None),
-            ["apis", group, version, plural, name] => (*group, *version, *plural, Some(*name)),
+        let (group, version, suffix) = match segments.as_slice() {
+            ["apis", group, version, suffix @ ..] if !suffix.is_empty() => {
+                (*group, *version, suffix)
+            }
             _ => return None,
         };
         let group_version = self.group_version(group, version)?;
-        let resource = group_version
-            .resources
-            .iter()
-            .find(|resource| resource.plural == plural)?
-            .clone();
-        if matches!(resource.scope, ResourceScope::Namespaced) {
-            return None;
+        let resolve = |plural: &str| {
+            group_version
+                .resources
+                .iter()
+                .find(|resource| resource.plural == plural)
+                .cloned()
+        };
+        let (resource, namespace, name, subresource) = match suffix {
+            [plural] => (resolve(plural)?, None, None, None),
+            [plural, name] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    None,
+                    matches!(resource.scope, ResourceScope::Cluster).then(|| (*name).to_owned()),
+                    None,
+                )
+            }
+            ["namespaces", namespace, plural] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    None,
+                    None,
+                )
+            }
+            ["namespaces", namespace, plural, name] => {
+                let resource = resolve(plural)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    matches!(resource.scope, ResourceScope::Namespaced).then(|| (*name).to_owned()),
+                    None,
+                )
+            }
+            ["namespaces", namespace, plural, name, subresource] => {
+                let resource = resolve(plural)?;
+                let subresource = resource
+                    .subresources
+                    .iter()
+                    .find(|strategy| strategy.name == *subresource)?;
+                (
+                    resource.clone(),
+                    matches!(resource.scope, ResourceScope::Namespaced)
+                        .then(|| (*namespace).to_owned()),
+                    matches!(resource.scope, ResourceScope::Namespaced).then(|| (*name).to_owned()),
+                    Some(subresource.name),
+                )
+            }
+            [plural, name, subresource] => {
+                let resource = resolve(plural)?;
+                let subresource = resource
+                    .subresources
+                    .iter()
+                    .find(|strategy| strategy.name == *subresource)?;
+                (
+                    resource.clone(),
+                    None,
+                    matches!(resource.scope, ResourceScope::Cluster).then(|| (*name).to_owned()),
+                    Some(subresource.name),
+                )
+            }
+            _ => return None,
+        };
+        match resource.scope {
+            ResourceScope::Cluster if namespace.is_some() => return None,
+            ResourceScope::Namespaced if namespace.is_none() => return None,
+            _ => {}
         }
         Some(ResolvedResourcePath {
             group: group_version.group,
             version: group_version.version,
             resource,
-            namespace: None,
-            name: name.map(str::to_owned),
-            subresource: None,
+            namespace,
+            name,
+            subresource,
         })
     }
 
@@ -614,6 +687,28 @@ mod tests {
                 && resource.kind == "TokenRequest"
                 && resource.verbs == ["create"]
         }));
+    }
+
+    #[test]
+    fn named_group_registry_resolves_cluster_and_namespaced_authorization_resources() {
+        let registry = ApiRegistry::core_v1();
+        let cluster = registry
+            .resolve_path("/apis/authorization.k8s.io/v1/subjectaccessreviews")
+            .expect("cluster-scoped SubjectAccessReview resolves");
+        assert_eq!(cluster.group, "authorization.k8s.io");
+        assert_eq!(cluster.resource.kind, "SubjectAccessReview");
+        assert_eq!(cluster.namespace, None);
+        assert_eq!(cluster.name, None);
+
+        let local = registry
+            .resolve_path(
+                "/apis/authorization.k8s.io/v1/namespaces/development/localsubjectaccessreviews",
+            )
+            .expect("namespaced LocalSubjectAccessReview resolves");
+        assert_eq!(local.group, "authorization.k8s.io");
+        assert_eq!(local.resource.kind, "LocalSubjectAccessReview");
+        assert_eq!(local.namespace.as_deref(), Some("development"));
+        assert_eq!(local.name, None);
     }
 
     #[test]

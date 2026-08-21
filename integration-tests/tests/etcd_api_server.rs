@@ -1596,6 +1596,135 @@ async fn subject_access_review_evaluates_delegated_rbac_identity_through_real_et
 }
 
 #[tokio::test]
+async fn local_subject_access_review_binds_path_namespace_through_real_etcd_core_server() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let prefix = format!("/rusternetes-lsar-tests/{}", Uuid::new_v4());
+    let backend = core_backend_from_etcd_config(Some(&endpoint), Some(&prefix))
+        .await
+        .expect("durable core backend initializes");
+    let delegator = RequestIdentity::authenticated(
+        "etcd-local-review-delegator",
+        Some("etcd-local-delegator-uid".to_owned()),
+        ["local-reviewers".to_owned()],
+        Default::default(),
+    )
+    .expect("local review delegator identity is valid");
+    let authentication = AuthenticationChain::new(
+        AnonymousPolicy::Deny,
+        vec![
+            StaticBearerToken::new("etcd-local-delegator-secret", delegator)
+                .expect("local review delegator token is valid"),
+        ],
+    );
+    let policy = RbacAuthorizer::new(
+        vec![
+            Role {
+                namespace: "default".to_owned(),
+                name: "etcd-local-review-creator".to_owned(),
+                rules: vec![PolicyRule {
+                    api_groups: vec!["authorization.k8s.io".to_owned()],
+                    resources: vec!["localsubjectaccessreviews".to_owned()],
+                    verbs: vec!["create".to_owned()],
+                    ..PolicyRule::default()
+                }],
+            },
+            Role {
+                namespace: "default".to_owned(),
+                name: "etcd-local-delegated-reader".to_owned(),
+                rules: vec![PolicyRule {
+                    api_groups: vec![String::new()],
+                    resources: vec!["configmaps".to_owned()],
+                    verbs: vec!["get".to_owned()],
+                    ..PolicyRule::default()
+                }],
+            },
+        ],
+        Vec::new(),
+        vec![
+            RoleBinding {
+                namespace: "default".to_owned(),
+                name: "etcd-local-review-creator-binding".to_owned(),
+                subjects: vec![Subject::User("etcd-local-review-delegator".to_owned())],
+                role_ref: RoleRef::Role("etcd-local-review-creator".to_owned()),
+            },
+            RoleBinding {
+                namespace: "default".to_owned(),
+                name: "etcd-local-delegated-reader-binding".to_owned(),
+                subjects: vec![Subject::User("etcd-local-delegated-workload".to_owned())],
+                role_ref: RoleRef::Role("etcd-local-delegated-reader".to_owned()),
+            },
+        ],
+        Vec::new(),
+    );
+    let server = start_core_server_with_auth_and_authorization(
+        backend,
+        authentication,
+        AuthorizationMode::Rbac(policy),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let endpoint = format!(
+        "{}/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+        server.base_url
+    );
+
+    let allowed_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-local-delegator-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "LocalSubjectAccessReview",
+            "spec": {
+                "user": "etcd-local-delegated-workload",
+                "uid": "etcd-local-workload-uid",
+                "extra": { "tenant": ["purple"] },
+                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+            }
+        }))
+        .send()
+        .await
+        .expect("allowed LocalSubjectAccessReview completes");
+    assert_eq!(allowed_response.status(), reqwest::StatusCode::OK);
+    let allowed: serde_json::Value = allowed_response
+        .json()
+        .await
+        .expect("allowed LocalSubjectAccessReview is JSON");
+    assert_eq!(allowed["status"]["allowed"], true);
+    assert_eq!(allowed["metadata"]["namespace"], "default");
+    assert_eq!(
+        allowed["spec"]["resourceAttributes"]["namespace"],
+        "default"
+    );
+    assert_eq!(allowed["spec"]["uid"], "etcd-local-workload-uid");
+    assert_eq!(
+        allowed["spec"]["extra"]["tenant"],
+        serde_json::json!(["purple"])
+    );
+
+    let no_opinion_response = client
+        .post(&endpoint)
+        .header("authorization", "Bearer etcd-local-delegator-secret")
+        .json(&serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "LocalSubjectAccessReview",
+            "spec": {
+                "user": "etcd-local-unbound-workload",
+                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+            }
+        }))
+        .send()
+        .await
+        .expect("no-opinion LocalSubjectAccessReview completes");
+    assert_eq!(no_opinion_response.status(), reqwest::StatusCode::OK);
+    let no_opinion: serde_json::Value = no_opinion_response
+        .json()
+        .await
+        .expect("no-opinion LocalSubjectAccessReview is JSON");
+    assert_eq!(no_opinion["status"]["allowed"], false);
+    assert!(no_opinion["status"].get("denied").is_none());
+}
+
+#[tokio::test]
 async fn config_map_pagination_preserves_an_etcd_snapshot_across_continuation_requests() {
     let (_etcd, endpoint) = start_etcd().await;
     let prefix = format!("/rusternetes-pagination-tests/{}", Uuid::new_v4());

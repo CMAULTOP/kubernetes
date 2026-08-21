@@ -23,10 +23,10 @@ use rusternetes_api_registry::ApiRegistry;
 use rusternetes_api_types::{
     AccessReviewNonResourceAttributes, AccessReviewResourceAttributes, ApiGroup, ApiGroupList,
     ApiResourceList, ApiStatus, ConfigMap, ConfigMapList, DeleteOptions, FieldSelector,
-    LabelSelector, Namespace, NamespaceList, NamespacePhase, Node, NodeList, Pod, PodList,
-    SelfSubjectAccessReview, ServiceAccount, ServiceAccountList, SubjectAccessReview,
-    SubjectAccessReviewStatus, TokenRequest, TokenReview, TokenReviewStatus, TokenReviewUserInfo,
-    TypeMeta,
+    LabelSelector, LocalSubjectAccessReview, Namespace, NamespaceList, NamespacePhase, Node,
+    NodeList, Pod, PodList, SelfSubjectAccessReview, ServiceAccount, ServiceAccountList,
+    SubjectAccessReview, SubjectAccessReviewSpec, SubjectAccessReviewStatus, TokenRequest,
+    TokenReview, TokenReviewStatus, TokenReviewUserInfo, TypeMeta,
 };
 use rusternetes_authn::{
     AuthenticationChain, KubernetesBoundObjectClaims, RequestIdentity, ServiceAccountJwksDocument,
@@ -749,6 +749,10 @@ pub fn router_with_core_backend_auth_authorization_and_admission(
         .route(
             "/apis/authorization.k8s.io/v1/subjectaccessreviews",
             axum::routing::post(create_subject_access_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/namespaces/:namespace/localsubjectaccessreviews",
+            axum::routing::post(create_local_subject_access_review),
         )
         .route("/api/v1", get(core_v1_api_resources))
         .route("/api/v1/configmaps", get(list_all_config_maps))
@@ -1896,7 +1900,7 @@ async fn create_subject_access_review(
     let mut review = decode_subject_access_review(body)?;
     review.enforce_type_meta()?;
     review.validate_request()?;
-    let identity = subject_access_review_identity(&review);
+    let identity = subject_access_review_identity(&review.spec);
     let request = subject_access_review_request(&review)?;
     let allowed = match &state.authorization {
         AuthorizationMode::AlwaysAllow => true,
@@ -1906,6 +1910,33 @@ async fn create_subject_access_review(
         allowed,
         // The current Rust RBAC evaluator is additive-only. A missing match is no opinion, not an
         // explicit deny verdict, even though the outer API request remains fail-closed.
+        denied: false,
+        reason: String::new(),
+        evaluation_error: String::new(),
+    };
+    Ok(Json(review))
+}
+
+/// Evaluates an explicit subject within the namespace encoded in the request path. The route is
+/// namespaced so normal middleware authorizes the caller against the same namespace before this
+/// handler is reached.
+async fn create_local_subject_access_review(
+    Path(namespace): Path<String>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<Json<LocalSubjectAccessReview>> {
+    let mut review = decode_local_subject_access_review(body)?;
+    review.enforce_type_meta()?;
+    review.validate_request(&namespace)?;
+    let identity = subject_access_review_identity(&review.spec);
+    let request = subject_access_review_spec_request(&review.spec)?;
+    let allowed = match &state.authorization {
+        AuthorizationMode::AlwaysAllow => true,
+        AuthorizationMode::Rbac(authorizer) => authorizer.authorize(&identity, &request),
+    };
+    review.status = SubjectAccessReviewStatus {
+        allowed,
+        // The current RBAC evaluator is additive-only; an unmatched request remains no opinion.
         denied: false,
         reason: String::new(),
         evaluation_error: String::new(),
@@ -1923,18 +1954,24 @@ fn self_subject_access_review_request(
 }
 
 fn subject_access_review_request(review: &SubjectAccessReview) -> ApiResult<AuthorizationRequest> {
+    subject_access_review_spec_request(&review.spec)
+}
+
+fn subject_access_review_spec_request(
+    spec: &SubjectAccessReviewSpec,
+) -> ApiResult<AuthorizationRequest> {
     access_review_request(
-        review.spec.resource_attributes.as_ref(),
-        review.spec.non_resource_attributes.as_ref(),
+        spec.resource_attributes.as_ref(),
+        spec.non_resource_attributes.as_ref(),
     )
 }
 
-fn subject_access_review_identity(review: &SubjectAccessReview) -> RequestIdentity {
+fn subject_access_review_identity(spec: &SubjectAccessReviewSpec) -> RequestIdentity {
     RequestIdentity {
-        username: review.spec.user.clone(),
-        uid: (!review.spec.uid.is_empty()).then(|| review.spec.uid.clone()),
-        groups: review.spec.groups.iter().cloned().collect(),
-        extra: review.spec.extra.clone(),
+        username: spec.user.clone(),
+        uid: (!spec.uid.is_empty()).then(|| spec.uid.clone()),
+        groups: spec.groups.iter().cloned().collect(),
+        extra: spec.extra.clone(),
     }
 }
 
@@ -2769,6 +2806,21 @@ fn decode_subject_access_review(body: Bytes) -> ApiResult<SubjectAccessReview> {
     serde_json::from_slice(&body).map_err(|error| {
         ApiError::BadRequest {
             message: format!("invalid SubjectAccessReview JSON: {error}"),
+        }
+        .into()
+    })
+}
+
+fn decode_local_subject_access_review(body: Bytes) -> ApiResult<LocalSubjectAccessReview> {
+    if body.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a LocalSubjectAccessReview JSON request body is required".to_owned(),
+        }
+        .into());
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        ApiError::BadRequest {
+            message: format!("invalid LocalSubjectAccessReview JSON: {error}"),
         }
         .into()
     })
@@ -5178,6 +5230,459 @@ mod tests {
         )
         .expect("AlwaysAllow SubjectAccessReview is JSON");
         assert_eq!(review["status"]["allowed"], true);
+    }
+
+    fn local_subject_access_review_test_app() -> Router {
+        let delegator = RequestIdentity::authenticated(
+            "local-review-delegator",
+            Some("local-delegator-uid".to_owned()),
+            ["local-reviewers".to_owned()],
+            Default::default(),
+        )
+        .expect("local review delegator identity is valid");
+        let untrusted = RequestIdentity::authenticated(
+            "local-untrusted-caller",
+            Some("local-untrusted-uid".to_owned()),
+            ["local-untrusted".to_owned()],
+            Default::default(),
+        )
+        .expect("local untrusted identity is valid");
+        let authentication = AuthenticationChain::new(
+            AnonymousPolicy::Deny,
+            vec![
+                StaticBearerToken::new("local-delegator-secret", delegator)
+                    .expect("local review delegator token is valid"),
+                StaticBearerToken::new("local-untrusted-secret", untrusted)
+                    .expect("local untrusted token is valid"),
+            ],
+        );
+        let authorizer = RbacAuthorizer::new(
+            vec![
+                rusternetes_authz_rbac::Role {
+                    namespace: "default".to_owned(),
+                    name: "local-review-creator".to_owned(),
+                    rules: vec![rusternetes_authz_rbac::PolicyRule {
+                        api_groups: vec!["authorization.k8s.io".to_owned()],
+                        resources: vec!["localsubjectaccessreviews".to_owned()],
+                        verbs: vec!["create".to_owned()],
+                        ..rusternetes_authz_rbac::PolicyRule::default()
+                    }],
+                },
+                rusternetes_authz_rbac::Role {
+                    namespace: "default".to_owned(),
+                    name: "local-workload-configmap-reader".to_owned(),
+                    rules: vec![rusternetes_authz_rbac::PolicyRule {
+                        api_groups: vec![String::new()],
+                        resources: vec!["configmaps".to_owned()],
+                        verbs: vec!["get".to_owned()],
+                        ..rusternetes_authz_rbac::PolicyRule::default()
+                    }],
+                },
+            ],
+            vec![rusternetes_authz_rbac::ClusterRole {
+                name: "local-review-discovery-reader".to_owned(),
+                rules: vec![rusternetes_authz_rbac::PolicyRule {
+                    verbs: vec!["get".to_owned()],
+                    non_resource_urls: vec!["/apis/authorization.k8s.io/v1".to_owned()],
+                    ..rusternetes_authz_rbac::PolicyRule::default()
+                }],
+            }],
+            vec![
+                rusternetes_authz_rbac::RoleBinding {
+                    namespace: "default".to_owned(),
+                    name: "local-review-creator-binding".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::User(
+                        "local-review-delegator".to_owned(),
+                    )],
+                    role_ref: rusternetes_authz_rbac::RoleRef::Role(
+                        "local-review-creator".to_owned(),
+                    ),
+                },
+                rusternetes_authz_rbac::RoleBinding {
+                    namespace: "default".to_owned(),
+                    name: "local-workload-reader-binding".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::User(
+                        "local-workload-reader".to_owned(),
+                    )],
+                    role_ref: rusternetes_authz_rbac::RoleRef::Role(
+                        "local-workload-configmap-reader".to_owned(),
+                    ),
+                },
+                rusternetes_authz_rbac::RoleBinding {
+                    namespace: "default".to_owned(),
+                    name: "local-group-reader-binding".to_owned(),
+                    subjects: vec![rusternetes_authz_rbac::Subject::Group(
+                        "local-readers".to_owned(),
+                    )],
+                    role_ref: rusternetes_authz_rbac::RoleRef::Role(
+                        "local-workload-configmap-reader".to_owned(),
+                    ),
+                },
+            ],
+            vec![rusternetes_authz_rbac::ClusterRoleBinding {
+                name: "local-review-discovery-reader-binding".to_owned(),
+                subjects: vec![rusternetes_authz_rbac::Subject::User(
+                    "local-review-delegator".to_owned(),
+                )],
+                role_ref: "local-review-discovery-reader".to_owned(),
+            }],
+        );
+        router_with_backend_auth_and_authorization(
+            ConfigMapBackend::InMemory(Arc::new(InMemoryConfigMapStore::new())),
+            authentication,
+            AuthorizationMode::Rbac(authorizer),
+        )
+    }
+
+    #[tokio::test]
+    async fn local_subject_access_review_binds_path_namespace_and_evaluates_delegated_subjects() {
+        let app = local_subject_access_review_test_app();
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apis/authorization.k8s.io/v1")
+                    .header("authorization", "Bearer local-delegator-secret")
+                    .body(Body::empty())
+                    .expect("valid local review discovery request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(discovery.status(), StatusCode::OK);
+        let discovery: serde_json::Value = serde_json::from_slice(
+            &to_bytes(discovery.into_body(), usize::MAX)
+                .await
+                .expect("local review discovery body is readable"),
+        )
+        .expect("local review discovery is JSON");
+        assert!(discovery["resources"]
+            .as_array()
+            .is_some_and(|resources| resources.iter().any(|resource| resource["name"]
+                == "localsubjectaccessreviews"
+                && resource["namespaced"] == true
+                && resource["kind"] == "LocalSubjectAccessReview"
+                && resource["verbs"] == serde_json::json!(["create"]))));
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                    .header("authorization", "Bearer local-delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "user": "local-workload-reader",
+                                "uid": "local-workload-uid",
+                                "extra": { "tenant": ["gold"] },
+                                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid local delegated review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let allowed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(allowed.into_body(), usize::MAX)
+                .await
+                .expect("allowed local review body is readable"),
+        )
+        .expect("allowed local review is JSON");
+        assert_eq!(allowed["status"]["allowed"], true);
+        assert_eq!(allowed["metadata"]["namespace"], "default");
+        assert_eq!(
+            allowed["spec"]["resourceAttributes"]["namespace"],
+            "default"
+        );
+        assert_eq!(allowed["spec"]["uid"], "local-workload-uid");
+        assert_eq!(
+            allowed["spec"]["extra"]["tenant"],
+            serde_json::json!(["gold"])
+        );
+
+        let group_only = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                    .header("authorization", "Bearer local-delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "groups": ["local-readers"],
+                                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid groups-only local review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(group_only.status(), StatusCode::OK);
+        let group_only: serde_json::Value = serde_json::from_slice(
+            &to_bytes(group_only.into_body(), usize::MAX)
+                .await
+                .expect("groups-only local review body is readable"),
+        )
+        .expect("groups-only local review is JSON");
+        assert_eq!(group_only["status"]["allowed"], true);
+        assert!(group_only["spec"].get("user").is_none());
+
+        let no_opinion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                    .header("authorization", "Bearer local-delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "user": "local-unbound-workload",
+                                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid local no-opinion review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(no_opinion.status(), StatusCode::OK);
+        let no_opinion: serde_json::Value = serde_json::from_slice(
+            &to_bytes(no_opinion.into_body(), usize::MAX)
+                .await
+                .expect("local no-opinion review body is readable"),
+        )
+        .expect("local no-opinion review is JSON");
+        assert_eq!(no_opinion["status"]["allowed"], false);
+        assert!(no_opinion["status"].get("denied").is_none());
+    }
+
+    #[tokio::test]
+    async fn local_subject_access_review_enforces_namespaced_caller_access_and_request_invariants()
+    {
+        let app = local_subject_access_review_test_app();
+        let forbidden_namespace = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/other/localsubjectaccessreviews")
+                    .header("authorization", "Bearer local-delegator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "user": "local-workload-reader",
+                                "resourceAttributes": {
+                                    "verb": "get", "resource": "configmaps", "namespace": "other"
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid other-namespace local review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(forbidden_namespace.status(), StatusCode::FORBIDDEN);
+
+        let untrusted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                    .header("authorization", "Bearer local-untrusted-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "user": "local-workload-reader",
+                                "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid untrusted local review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(untrusted.status(), StatusCode::FORBIDDEN);
+
+        let invalid_requests = [
+            (
+                "missing subject",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "spec": { "resourceAttributes": { "verb": "get", "resource": "configmaps" } }
+                }),
+            ),
+            (
+                "non-resource target",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "spec": {
+                        "user": "local-workload-reader",
+                        "nonResourceAttributes": { "verb": "get", "path": "/healthz" }
+                    }
+                }),
+            ),
+            (
+                "resource namespace mismatch",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "spec": {
+                        "user": "local-workload-reader",
+                        "resourceAttributes": {
+                            "verb": "get", "resource": "configmaps", "namespace": "other"
+                        }
+                    }
+                }),
+            ),
+            (
+                "metadata namespace mismatch",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "metadata": { "namespace": "other" },
+                    "spec": {
+                        "user": "local-workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    }
+                }),
+            ),
+            (
+                "client supplied status",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "spec": {
+                        "user": "local-workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    },
+                    "status": { "allowed": true }
+                }),
+            ),
+            (
+                "metadata name is forbidden",
+                serde_json::json!({
+                    "apiVersion": "authorization.k8s.io/v1",
+                    "kind": "LocalSubjectAccessReview",
+                    "metadata": { "name": "not-persistent" },
+                    "spec": {
+                        "user": "local-workload-reader",
+                        "resourceAttributes": { "verb": "get", "resource": "configmaps" }
+                    }
+                }),
+            ),
+        ];
+        for (description, body) in invalid_requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                        .header("authorization", "Bearer local-delegator-secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|error| {
+                            panic!("valid {description} LocalSubjectAccessReview request: {error}")
+                        }),
+                )
+                .await
+                .expect("router is infallible");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{description} is rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_subject_access_review_always_allow_binds_the_path_namespace() {
+        let response = router(Arc::new(InMemoryConfigMapStore::new()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "authorization.k8s.io/v1",
+                            "kind": "LocalSubjectAccessReview",
+                            "spec": {
+                                "user": "local-arbitrary-subject",
+                                "resourceAttributes": { "verb": "delete", "resource": "secrets" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("valid AlwaysAllow local review request"),
+            )
+            .await
+            .expect("router is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        let review: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("AlwaysAllow local review body is readable"),
+        )
+        .expect("AlwaysAllow local review is JSON");
+        assert_eq!(review["status"]["allowed"], true);
+        assert_eq!(review["metadata"]["namespace"], "default");
+        assert_eq!(review["spec"]["resourceAttributes"]["namespace"], "default");
+    }
+
+    #[test]
+    fn local_subject_access_review_path_maps_to_namespaced_authorization_create_resource() {
+        let request = authorization_request_from_http(
+            &ApiRegistry::core_v1(),
+            &axum::http::Method::POST,
+            &"/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews"
+                .parse()
+                .expect("valid LocalSubjectAccessReview URI"),
+        );
+        assert_eq!(request.verb, "create");
+        assert!(matches!(
+            request.target,
+            rusternetes_authz_rbac::RequestTarget::Resource {
+                api_group,
+                resource,
+                subresource,
+                namespace,
+                name,
+            } if api_group == "authorization.k8s.io"
+                && resource == "localsubjectaccessreviews"
+                && subresource.is_none()
+                && namespace.as_deref() == Some("default")
+                && name.is_none()
+        ));
     }
 
     #[test]

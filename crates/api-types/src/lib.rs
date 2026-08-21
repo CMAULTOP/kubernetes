@@ -19,6 +19,7 @@ pub const TOKEN_REQUEST_KIND: &str = "TokenRequest";
 pub const TOKEN_REVIEW_KIND: &str = "TokenReview";
 pub const SELF_SUBJECT_ACCESS_REVIEW_KIND: &str = "SelfSubjectAccessReview";
 pub const SUBJECT_ACCESS_REVIEW_KIND: &str = "SubjectAccessReview";
+pub const LOCAL_SUBJECT_ACCESS_REVIEW_KIND: &str = "LocalSubjectAccessReview";
 pub const MAX_CONFIG_MAP_DATA_BYTES: usize = 1024 * 1024;
 
 /// Kubernetes type metadata.
@@ -137,6 +138,13 @@ impl TypeMeta {
         Self {
             api_version: AUTHORIZATION_V1_API_VERSION.to_owned(),
             kind: SUBJECT_ACCESS_REVIEW_KIND.to_owned(),
+        }
+    }
+
+    pub fn local_subject_access_review() -> Self {
+        Self {
+            api_version: AUTHORIZATION_V1_API_VERSION.to_owned(),
+            kind: LOCAL_SUBJECT_ACCESS_REVIEW_KIND.to_owned(),
         }
     }
 }
@@ -683,6 +691,114 @@ impl SubjectAccessReviewSpec {
                     .to_owned(),
             }),
         }
+    }
+}
+
+/// A namespaced create-only authorization.k8s.io/v1 request that delegates a resource
+/// authorization decision for one explicit subject in the request-path namespace.
+///
+/// It is non-persistent: the API server binds its namespace, evaluates the request, and returns a
+/// server-owned status without writing it to storage.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSubjectAccessReview {
+    #[serde(flatten)]
+    pub type_meta: TypeMeta,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: SubjectAccessReviewSpec,
+    #[serde(default)]
+    pub status: SubjectAccessReviewStatus,
+}
+
+impl LocalSubjectAccessReview {
+    pub fn enforce_type_meta(&mut self) -> Result<(), ApiError> {
+        if !self.type_meta.api_version.is_empty()
+            && self.type_meta.api_version != AUTHORIZATION_V1_API_VERSION
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "apiVersion must be {AUTHORIZATION_V1_API_VERSION}, got {}",
+                    self.type_meta.api_version
+                ),
+            });
+        }
+        if !self.type_meta.kind.is_empty()
+            && self.type_meta.kind != LOCAL_SUBJECT_ACCESS_REVIEW_KIND
+        {
+            return Err(ApiError::Invalid {
+                message: format!(
+                    "kind must be {LOCAL_SUBJECT_ACCESS_REVIEW_KIND}, got {}",
+                    self.type_meta.kind
+                ),
+            });
+        }
+        self.type_meta = TypeMeta::local_subject_access_review();
+        Ok(())
+    }
+
+    /// Validates client-owned fields, canonicalizes `metadata.namespace` from the URL, and binds
+    /// the reviewed resource to that namespace. A local review cannot evaluate non-resource URLs.
+    pub fn validate_request(&mut self, request_namespace: &str) -> Result<(), ApiError> {
+        if request_namespace.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "a LocalSubjectAccessReview request namespace is required".to_owned(),
+            });
+        }
+        if let Some(namespace) = self.metadata.namespace.as_deref() {
+            if namespace != request_namespace {
+                return Err(ApiError::Invalid {
+                    message: "metadata.namespace must match the LocalSubjectAccessReview request namespace"
+                        .to_owned(),
+                });
+            }
+        }
+        let mut metadata_without_namespace = self.metadata.clone();
+        metadata_without_namespace.namespace = None;
+        if metadata_without_namespace != ObjectMeta::default() {
+            return Err(ApiError::Invalid {
+                message: "metadata must be empty except for namespace in a LocalSubjectAccessReview request"
+                    .to_owned(),
+            });
+        }
+        if !self.status.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "status is server-owned and must not be set in a LocalSubjectAccessReview request"
+                    .to_owned(),
+            });
+        }
+        if self.spec.user.is_empty() && self.spec.groups.is_empty() {
+            return Err(ApiError::Invalid {
+                message: "at least one of spec.user or spec.groups must be set".to_owned(),
+            });
+        }
+        if self.spec.non_resource_attributes.is_some() {
+            return Err(ApiError::Invalid {
+                message:
+                    "spec.nonResourceAttributes is not supported by a LocalSubjectAccessReview"
+                        .to_owned(),
+            });
+        }
+        let resource = self
+            .spec
+            .resource_attributes
+            .as_mut()
+            .ok_or_else(|| ApiError::Invalid {
+                message: "spec.resourceAttributes is required by a LocalSubjectAccessReview"
+                    .to_owned(),
+            })?;
+        resource.validate()?;
+        if resource.namespace.is_empty() {
+            resource.namespace = request_namespace.to_owned();
+        } else if resource.namespace != request_namespace {
+            return Err(ApiError::Invalid {
+                message: "spec.resourceAttributes.namespace must match the LocalSubjectAccessReview request namespace"
+                    .to_owned(),
+            });
+        }
+        self.metadata.namespace = Some(request_namespace.to_owned());
+        Ok(())
     }
 }
 
@@ -2622,6 +2738,63 @@ mod tests {
         assert!(selector.matches(&config_map()));
         assert!(matches!(
             FieldSelector::parse(Some("spec.nodeName=worker-a")),
+            Err(ApiError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn local_subject_access_review_binds_the_path_namespace_and_rejects_conflicts() {
+        let mut review = LocalSubjectAccessReview {
+            spec: SubjectAccessReviewSpec {
+                groups: vec!["team-a".to_owned()],
+                resource_attributes: Some(AccessReviewResourceAttributes {
+                    verb: "get".to_owned(),
+                    resource: "configmaps".to_owned(),
+                    ..AccessReviewResourceAttributes::default()
+                }),
+                ..SubjectAccessReviewSpec::default()
+            },
+            ..LocalSubjectAccessReview::default()
+        };
+        review
+            .enforce_type_meta()
+            .expect("empty TypeMeta is canonicalized");
+        review
+            .validate_request("development")
+            .expect("groups-only local review is valid");
+        assert_eq!(review.type_meta, TypeMeta::local_subject_access_review());
+        assert_eq!(review.metadata.namespace.as_deref(), Some("development"));
+        assert_eq!(
+            review
+                .spec
+                .resource_attributes
+                .as_ref()
+                .map(|attributes| attributes.namespace.as_str()),
+            Some("development")
+        );
+
+        review
+            .spec
+            .resource_attributes
+            .as_mut()
+            .expect("resource target is present")
+            .namespace = "other".to_owned();
+        assert!(matches!(
+            review.validate_request("development"),
+            Err(ApiError::Invalid { .. })
+        ));
+        review
+            .spec
+            .resource_attributes
+            .as_mut()
+            .expect("resource target is present")
+            .namespace = "development".to_owned();
+        review.spec.non_resource_attributes = Some(AccessReviewNonResourceAttributes {
+            verb: "get".to_owned(),
+            path: "/healthz".to_owned(),
+        });
+        assert!(matches!(
+            review.validate_request("development"),
             Err(ApiError::Invalid { .. })
         ));
     }
